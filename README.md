@@ -25,6 +25,7 @@ xcaddy build --with github.com/ScaleCommerce/caddy-geoip2
   # Configure the GeoIP2 database globally
   geoip2 {
     database_path /path/to/GeoLite2-City.mmdb
+    asn_database_path /path/to/GeoLite2-ASN.mmdb  # optional, for complete ASN data
     reload_interval daily  # daily, weekly, off, or hours (e.g., 24)
   }
 
@@ -271,10 +272,36 @@ example.com {
 ## Database Compatibility
 
 Works with MaxMind databases:
-- **GeoLite2-City** (free, recommended)
+- **GeoLite2-City** (free, recommended for geographic data)
 - **GeoIP2-City** (commercial)
 - **GeoLite2-Country** (limited data)
 - **GeoIP2-Country** (limited data)
+- **GeoLite2-ASN** (free, recommended for ASN data)
+
+### Dual-Database Setup for Complete Data Coverage
+
+For performance-critical applications that need all 8 variables populated, use the dual-database approach:
+
+```caddyfile
+{
+  geoip2 {
+    database_path /opt/geoip/GeoLite2-City.mmdb      # 61MB - provides geographic data
+    asn_database_path /opt/geoip/GeoLite2-ASN.mmdb   # 10MB - provides ASN data
+    reload_interval daily
+  }
+}
+```
+
+**Why dual databases?**
+- **GeoLite2-City**: Contains city, country, coordinates, subdivisions, EU status - but NO ASN data
+- **GeoLite2-ASN**: Contains ASN number and organization - but NO geographic data
+- **Combined**: All 8 variables populated with optimal performance (71MB total vs 108MB+ for commercial alternatives)
+
+**Performance benefits:**
+- Faster lookups than single large database
+- Only 71MB total memory usage
+- Automatic fallback if ASN database unavailable
+- Free alternative to expensive commercial databases
 
 ## Error Handling
 

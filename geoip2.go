@@ -41,6 +41,13 @@ type GeoIP2Record struct {
 	} `maxminddb:"traits"`
 }
 
+// ASNRecord defines the structure for ASN database lookups
+// Used when main database doesn't contain ASN data
+type ASNRecord struct {
+	AutonomousSystemNumber       uint64 `maxminddb:"autonomous_system_number"`       // ASN number
+	AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"` // ASN organization name
+}
+
 // GeoIP2 is the HTTP middleware handler that provides GeoIP2 functionality
 // It enriches requests with geographic information based on client IP
 type GeoIP2 struct {
@@ -148,13 +155,32 @@ func (m *GeoIP2) performLookup(r *http.Request, repl *caddy.Replacer) {
 		return
 	}
 
-	// Perform database lookup
+	// Perform main database lookup
 	var record GeoIP2Record
 	if err := m.state.Lookup(clientIP, &record); err != nil {
 		caddy.Log().Named("http.handlers.geoip2").Debug("GeoIP2 lookup failed",
 			zap.String("ip", clientIP.String()),
 			zap.Error(err))
 		return
+	}
+
+	// If ASN data is missing from main database and ASN database is available, lookup ASN data
+	if (record.Traits.AutonomousSystemNumber == 0 || record.Traits.AutonomousSystemOrganization == "") && 
+	   m.state.ASNDBHandler != nil {
+		var asnRecord ASNRecord
+		if err := m.state.LookupASN(clientIP, &asnRecord); err == nil {
+			// Supplement main record with ASN data
+			if record.Traits.AutonomousSystemNumber == 0 {
+				record.Traits.AutonomousSystemNumber = asnRecord.AutonomousSystemNumber
+			}
+			if record.Traits.AutonomousSystemOrganization == "" {
+				record.Traits.AutonomousSystemOrganization = asnRecord.AutonomousSystemOrganization
+			}
+		} else {
+			caddy.Log().Named("http.handlers.geoip2").Debug("ASN lookup failed",
+				zap.String("ip", clientIP.String()),
+				zap.Error(err))
+		}
 	}
 
 	// Populate replacer variables with lookup results
@@ -164,7 +190,8 @@ func (m *GeoIP2) performLookup(r *http.Request, repl *caddy.Replacer) {
 	caddy.Log().Named("http.handlers.geoip2").Debug("GeoIP2 lookup successful",
 		zap.String("ip", clientIP.String()),
 		zap.String("country", record.Country.ISOCode),
-		zap.String("city", record.City.Names["en"]))
+		zap.String("city", record.City.Names["en"]),
+		zap.Uint64("asn", record.Traits.AutonomousSystemNumber))
 }
 
 // setGeoIPVariables populates all GeoIP2 variables from the lookup result

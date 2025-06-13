@@ -24,17 +24,27 @@ import (
 // - Thread-safe database access
 // - Automatic database reloading
 // - Shared state across multiple handler instances
+// - Support for dual databases (City + ASN) for complete data coverage
 type GeoIP2State struct {
-	// DBHandler is the MaxMind database reader instance
+	// DBHandler is the MaxMind database reader instance for main database (City/Country)
 	// Protected by mutex for thread-safe access
 	DBHandler *maxminddb.Reader `json:"-"`
 	
-	// mutex protects concurrent access to DBHandler
+	// ASNDBHandler is the MaxMind ASN database reader instance
+	// Used to supplement City database with ASN data when needed
+	ASNDBHandler *maxminddb.Reader `json:"-"`
+	
+	// mutex protects concurrent access to both DBHandler and ASNDBHandler
 	mutex *sync.RWMutex `json:"-"`
 	
-	// DatabasePath is the filesystem path to the GeoIP2 database file
+	// DatabasePath is the filesystem path to the main GeoIP2 database file
 	// Example: "/etc/geoip/GeoLite2-City.mmdb"
 	DatabasePath string `json:"database_path,omitempty"`
+	
+	// ASNDatabasePath is the filesystem path to the ASN database file
+	// Example: "/etc/geoip/GeoLite2-ASN.mmdb"
+	// Optional: if not specified, ASN data will be empty
+	ASNDatabasePath string `json:"asn_database_path,omitempty"`
 	
 	// ReloadInterval specifies how often to reload the database (in hours)
 	// 0 = no automatic reloading, manual reload via caddy admin API only
@@ -135,6 +145,7 @@ func (g *GeoIP2State) Stop() error {
 // Expected format:
 //   geoip2 {
 //     database_path /path/to/database.mmdb
+//     asn_database_path /path/to/asn.mmdb  # optional
 //     reload_interval daily
 //   }
 func (g *GeoIP2State) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -154,6 +165,16 @@ func (g *GeoIP2State) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				g.DatabasePath = os.ExpandEnv(g.DatabasePath)
 				if !filepath.IsAbs(g.DatabasePath) {
 					g.DatabasePath, _ = filepath.Abs(g.DatabasePath)
+				}
+				
+			case "asn_database_path":
+				if !d.Args(&g.ASNDatabasePath) {
+					return d.ArgErr()
+				}
+				// Expand environment variables and resolve relative paths
+				g.ASNDatabasePath = os.ExpandEnv(g.ASNDatabasePath)
+				if !filepath.IsAbs(g.ASNDatabasePath) {
+					g.ASNDatabasePath, _ = filepath.Abs(g.ASNDatabasePath)
 				}
 				
 			case "reload_interval":
@@ -180,6 +201,7 @@ func (g *GeoIP2State) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	
 	caddy.Log().Named("geoip2").Info("configured GeoIP2 app",
 		zap.String("database_path", g.DatabasePath),
+		zap.String("asn_database_path", g.ASNDatabasePath),
 		zap.String("reload_interval", fmt.Sprintf("%dh", g.ReloadInterval)))
 	
 	return nil
@@ -217,57 +239,97 @@ func (g *GeoIP2State) setDefaults() {
 
 // loadDatabase loads or reloads the GeoIP2 database from disk
 // This method is thread-safe and can be called concurrently
+// Supports loading both main database and optional ASN database
 func (g *GeoIP2State) loadDatabase() error {
-	// Validate database file exists and is readable
-	if err := g.validateDatabaseFile(); err != nil {
-		return err
+	// Validate main database file exists and is readable
+	if err := g.validateDatabaseFile(g.DatabasePath); err != nil {
+		return fmt.Errorf("main database validation failed: %v", err)
+	}
+	
+	// Validate ASN database if specified
+	var asnDBValid bool
+	if g.ASNDatabasePath != "" {
+		if err := g.validateDatabaseFile(g.ASNDatabasePath); err != nil {
+			caddy.Log().Named("geoip2").Warn("ASN database validation failed, ASN data will be empty",
+				zap.String("asn_path", g.ASNDatabasePath),
+				zap.Error(err))
+		} else {
+			asnDBValid = true
+		}
 	}
 	
 	// Acquire exclusive lock for database replacement
 	g.mutex.Lock()
 	defer g.mutex.Unlock()
 	
-	// Open new database instance
+	// Open new main database instance
 	newDB, err := maxminddb.Open(g.DatabasePath)
 	if err != nil {
-		return fmt.Errorf("failed to open database %s: %v", g.DatabasePath, err)
+		return fmt.Errorf("failed to open main database %s: %v", g.DatabasePath, err)
 	}
 	
-	// Close old database if present
+	// Open ASN database if valid
+	var newASNDB *maxminddb.Reader
+	if asnDBValid {
+		newASNDB, err = maxminddb.Open(g.ASNDatabasePath)
+		if err != nil {
+			caddy.Log().Named("geoip2").Warn("failed to open ASN database, ASN data will be empty",
+				zap.String("asn_path", g.ASNDatabasePath),
+				zap.Error(err))
+			newASNDB = nil
+		}
+	}
+	
+	// Close old databases if present
 	if g.DBHandler != nil {
 		if err := g.DBHandler.Close(); err != nil {
-			caddy.Log().Named("geoip2").Warn("error closing old database", 
+			caddy.Log().Named("geoip2").Warn("error closing old main database", 
+				zap.Error(err))
+		}
+	}
+	if g.ASNDBHandler != nil {
+		if err := g.ASNDBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing old ASN database", 
 				zap.Error(err))
 		}
 	}
 	
-	// Replace with new database
+	// Replace with new databases
 	g.DBHandler = newDB
+	g.ASNDBHandler = newASNDB
 	
 	// Log successful load with database metadata
 	metadata := newDB.Metadata
-	caddy.Log().Named("geoip2").Info("database loaded successfully",
+	caddy.Log().Named("geoip2").Info("main database loaded successfully",
 		zap.String("path", g.DatabasePath),
 		zap.Uint64("build_epoch", uint64(metadata.BuildEpoch)),
 		zap.String("database_type", metadata.DatabaseType))
+	
+	if newASNDB != nil {
+		asnMetadata := newASNDB.Metadata
+		caddy.Log().Named("geoip2").Info("ASN database loaded successfully",
+			zap.String("path", g.ASNDatabasePath),
+			zap.Uint64("build_epoch", uint64(asnMetadata.BuildEpoch)),
+			zap.String("database_type", asnMetadata.DatabaseType))
+	}
 	
 	return nil
 }
 
 // validateDatabaseFile checks if the database file exists and is accessible
-func (g *GeoIP2State) validateDatabaseFile() error {
+func (g *GeoIP2State) validateDatabaseFile(path string) error {
 	// Check if file exists
-	info, err := os.Stat(g.DatabasePath)
+	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("database file not found: %s", g.DatabasePath)
+			return fmt.Errorf("database file not found: %s", path)
 		}
-		return fmt.Errorf("cannot access database file %s: %v", g.DatabasePath, err)
+		return fmt.Errorf("cannot access database file %s: %v", path, err)
 	}
 	
 	// Check if it's a regular file (not directory, symlink, etc.)
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("database path is not a regular file: %s", g.DatabasePath)
+		return fmt.Errorf("database path is not a regular file: %s", path)
 	}
 	
 	// Check minimum file size (MaxMind databases are at least a few MB)
@@ -350,6 +412,36 @@ func (g *GeoIP2State) Lookup(ip interface{}, result interface{}) error {
 	return g.DBHandler.Lookup(netIP, result)
 }
 
+// LookupASN performs a thread-safe ASN database lookup
+// Used to supplement main database with ASN data when needed
+func (g *GeoIP2State) LookupASN(ip interface{}, result interface{}) error {
+	// Acquire read lock for database access
+	g.mutex.RLock()
+	defer g.mutex.RUnlock()
+	
+	// Check if ASN database is available
+	if g.ASNDBHandler == nil {
+		return errors.New("ASN database not loaded")
+	}
+	
+	// Convert interface{} to net.IP if needed
+	var netIP net.IP
+	switch v := ip.(type) {
+	case net.IP:
+		netIP = v
+	case string:
+		netIP = net.ParseIP(v)
+		if netIP == nil {
+			return fmt.Errorf("invalid IP address: %s", v)
+		}
+	default:
+		return fmt.Errorf("unsupported IP type: %T", ip)
+	}
+	
+	// Perform the actual ASN lookup
+	return g.ASNDBHandler.Lookup(netIP, result)
+}
+
 // GetDatabaseInfo returns information about the currently loaded database
 // Useful for monitoring and debugging
 func (g *GeoIP2State) GetDatabaseInfo() map[string]interface{} {
@@ -394,7 +486,7 @@ func (g GeoIP2State) Validate() error {
 	}
 	
 	// Validate database file
-	if err := g.validateDatabaseFile(); err != nil {
+	if err := g.validateDatabaseFile(g.DatabasePath); err != nil {
 		return fmt.Errorf("database validation failed: %v", err)
 	}
 	
