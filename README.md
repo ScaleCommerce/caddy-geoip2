@@ -13,7 +13,7 @@ A high-performance GeoIP2 middleware for Caddy that provides geographic informat
 ## Build
 
 ```bash
-xcaddy build --with github.com/zhangjiayin/caddy-geoip2
+xcaddy build --with github.com/ScaleCommerce/caddy-geoip2
 ```
 
 ## Configuration
@@ -27,7 +27,7 @@ xcaddy build --with github.com/zhangjiayin/caddy-geoip2
     database_path /path/to/GeoLite2-City.mmdb
     reload_interval daily  # daily, weekly, off, or hours (e.g., 24)
   }
-  
+
   # Order matters - GeoIP2 must run before directives that use the variables
   order geoip2_vars before header
 }
@@ -42,15 +42,15 @@ example.com {
   # - wild: trust any X-Forwarded-For header
   # - trusted_proxies: trust X-Forwarded-For only from trusted proxies (default)
   geoip2_vars strict
-  
+
   # Use GeoIP2 variables in directives
   header Country-Code "{geoip2_country_code}"
   header Is-EU "{geoip2_is_in_eu}"
-  
+
   # Conditional responses based on location
   @eu_visitors expression {geoip2_is_in_eu} == true
   respond @eu_visitors "Hello from the EU!"
-  
+
   # Log geographic data
   log {
     format json
@@ -61,7 +61,7 @@ example.com {
       asn {geoip2_asn}
     }
   }
-  
+
   respond "Hello from {geoip2_city}, {geoip2_country_code}!"
 }
 ```
@@ -95,18 +95,18 @@ The module provides 8 essential GeoIP2 variables:
 
 api.example.com {
   geoip2_vars trusted_proxies
-  
+
   # Block requests from certain countries
   @blocked_countries expression {geoip2_country_code} in ["CN", "RU", "KP"]
   respond @blocked_countries "Access denied" 403
-  
+
   # Rate limit by geographic region
   @high_traffic expression {geoip2_country_code} in ["US", "GB", "DE"]
   rate_limit @high_traffic 100r/m
-  
+
   @low_traffic expression !({geoip2_country_code} in ["US", "GB", "DE"])
   rate_limit @low_traffic 10r/m
-  
+
   reverse_proxy localhost:8080
 }
 ```
@@ -123,7 +123,7 @@ api.example.com {
 
 localhost {
   geoip2_vars wild  # More permissive for development
-  
+
   respond `
   IP: {remote_host}
   Location: {geoip2_city}, {geoip2_country_code}
@@ -146,7 +146,7 @@ localhost {
 
 example.com {
   geoip2_vars trusted_proxies
-  
+
   log {
     output file /var/log/caddy/geo.log
     format json
@@ -158,17 +158,17 @@ example.com {
       geo_lng {geoip2_longitude}
       geo_subdivision {geoip2_subdivisions}
       geo_eu {geoip2_is_in_eu}
-      
+
       # Network data
       asn {geoip2_asn}
       as_org {geoip2_asorg}
-      
+
       # Request data
       user_agent {>User-Agent}
       real_ip {remote_host}
     }
   }
-  
+
   reverse_proxy backend:8080
 }
 ```
@@ -189,10 +189,10 @@ example.com {
 example.com {
   # 1. geoip2_vars middleware runs first → sets variables
   geoip2_vars strict
-  
+
   # 2. Then header directive can use the variables
   header Country-Code "{geoip2_country_code}"  # ✅ Variable available
-  
+
   # 3. respond directive can also use them
   respond "Hello from {geoip2_city}!"  # ✅ Variable available
 }
@@ -280,7 +280,7 @@ Works with MaxMind databases:
 
 The module gracefully handles:
 - Missing database files
-- Corrupted databases  
+- Corrupted databases
 - Invalid IP addresses
 - Database reload failures
 - Network interruptions
