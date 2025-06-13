@@ -1,130 +1,320 @@
-# GeoIP2
+# GeoIP2 Module for Caddy
 
-Provides middleware for resolving a users IP address against the Maxmind Geo IP Database.
+A high-performance GeoIP2 middleware for Caddy that provides geographic information based on client IP addresses.
 
-Manages Downloading and Refreshing the Maxmind Database via https://github.com/maxmind/geoipupdate
+## Features
+
+- **Minimal & Fast**: Only extracts the essential GeoIP2 data you actually need
+- **Thread-safe**: Concurrent request handling with read/write locks
+- **Auto-reload**: Configurable database reloading (daily, weekly, or custom intervals)
+- **Smart IP Detection**: Flexible handling of X-Forwarded-For headers with security controls
+- **Memory Efficient**: Optimized data structures to minimize allocations
 
 ## Build
 
-```sh
-xcaddy  \
-  --with github.com/zhangjiayin/caddy-geoip2
+```bash
+xcaddy build --with github.com/zhangjiayin/caddy-geoip2
 ```
 
-## Caddyfile example
+## Configuration
 
-```
+### Global App Configuration
+
+```caddyfile
 {
-  order geoip2_vars first
-
-  # Only configure databaseDirectory and editionID when autoupdate is not desired.
+  # Configure the GeoIP2 database globally
   geoip2 {
-    accountId         xxxx
-    databaseDirectory "/tmp/"
-    licenseKey        "xxxx"
-    lockFile          "/tmp/geoip2.lock"
-    editionID         "GeoLite2-City"
-    updateUrl         "https://updates.maxmind.com"
-    updateFrequency   86400   # in seconds
+    database_path /path/to/GeoLite2-City.mmdb
+    reload_interval daily  # daily, weekly, off, or hours (e.g., 24)
+  }
+  
+  # Order matters - GeoIP2 must run before directives that use the variables
+  order geoip2_vars before header
+}
+```
+
+### Site-specific Handler
+
+```caddyfile
+example.com {
+  # Enable GeoIP2 with IP detection mode:
+  # - strict: only use RemoteAddr (ignore X-Forwarded-For)
+  # - wild: trust any X-Forwarded-For header
+  # - trusted_proxies: trust X-Forwarded-For only from trusted proxies (default)
+  geoip2_vars strict
+  
+  # Use GeoIP2 variables in directives
+  header Country-Code "{geoip2_country_code}"
+  header Is-EU "{geoip2_is_in_eu}"
+  
+  # Conditional responses based on location
+  @eu_visitors expression {geoip2_is_in_eu} == true
+  respond @eu_visitors "Hello from the EU!"
+  
+  # Log geographic data
+  log {
+    format json
+    append {
+      country {geoip2_country_code}
+      city {geoip2_city}
+      coordinates "{geoip2_latitude},{geoip2_longitude}"
+      asn {geoip2_asn}
+    }
+  }
+  
+  respond "Hello from {geoip2_city}, {geoip2_country_code}!"
+}
+```
+
+## Available Variables
+
+The module provides 8 essential GeoIP2 variables:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `{geoip2_city}` | City name (English) | `"Munich"` |
+| `{geoip2_country_code}` | Two-letter country code | `"DE"` |
+| `{geoip2_latitude}` | Geographic latitude | `48.1374` |
+| `{geoip2_longitude}` | Geographic longitude | `11.5755` |
+| `{geoip2_subdivisions}` | State/Province code | `"BY"` |
+| `{geoip2_is_in_eu}` | EU membership status | `true` |
+| `{geoip2_asn}` | Autonomous System Number | `3320` |
+| `{geoip2_asorg}` | AS Organization | `"Deutsche Telekom AG"` |
+
+## Advanced Examples
+
+### Geographic Access Control
+
+```caddyfile
+{
+  geoip2 {
+    database_path /etc/geoip/GeoLite2-City.mmdb
+    reload_interval daily
+  }
+}
+
+api.example.com {
+  geoip2_vars trusted_proxies
+  
+  # Block requests from certain countries
+  @blocked_countries expression {geoip2_country_code} in ["CN", "RU", "KP"]
+  respond @blocked_countries "Access denied" 403
+  
+  # Rate limit by geographic region
+  @high_traffic expression {geoip2_country_code} in ["US", "GB", "DE"]
+  rate_limit @high_traffic 100r/m
+  
+  @low_traffic expression !({geoip2_country_code} in ["US", "GB", "DE"])
+  rate_limit @low_traffic 10r/m
+  
+  reverse_proxy localhost:8080
+}
+```
+
+### Development vs Production Database
+
+```caddyfile
+{
+  geoip2 {
+    database_path {$GEOIP_DATABASE_PATH:/opt/geoip/GeoLite2-City.mmdb}
+    reload_interval {$GEOIP_RELOAD_INTERVAL:daily}
   }
 }
 
 localhost {
-  geoip2_vars strict 
-  # strict: Alway ignore 'X-Forwarded-For' header 
-  # wild:   Trust 'X-Forwarded-For' header if existed
-  # trusted_proxies: Trust 'X-Forwarded-For' header if trusted_proxies is also valid (see https://caddyserver.com/docs/caddyfile/options#trusted-proxies)
-  # default: trusted_proxies
-
-  # Add country and state code to the header
-  header geoip-country "{geoip2.country_code}"
-  header geoip-subdivision "{geoip2.subdivisions_1_iso_code}"
-
-  # Respond to anyone in the US and Canada, but not from Ohio
-  @geofilter expression ({geoip2.country_code} == "US" || {geoip2.country_code} == "CA") && {geoip2.subdivisions_1_iso_code} != "OH"
+  geoip2_vars wild  # More permissive for development
   
-  respond @geofilter "hello everyone except Ohioan:
-    geoip2.country_code:{geoip2.country_code}
-    geoip2.country_name:{geoip2.country_name}
-    geoip2.city_geoname_id:{geoip2.city_geoname_id}
-    geoip2.city_name:{geoip2.city_name}
-    geoip2.location_latitude:{geoip2.location_latitude}
-    geoip2.location_longitude:{geoip2.location_longitude}
-    geoip2.location_time_zone:{geoip2.location_time_zone}"
+  respond `
+  IP: {remote_host}
+  Location: {geoip2_city}, {geoip2_country_code}
+  Coordinates: {geoip2_latitude}, {geoip2_longitude}
+  EU Member: {geoip2_is_in_eu}
+  ASN: {geoip2_asn} ({geoip2_asorg})
+  `
 }
-
 ```
 
-## variables
+### Comprehensive Logging
 
-- geoip2.ip_address
-- geoip2.country_code
-- geoip2.country_name
-- geoip2.country_eu
-- geoip2.country_locales
-- geoip2.country_confidence
-- geoip2.country_names
-- geoip2.country_geoname_id
-- geoip2.continent_code
-- geoip2.continent_locales
-- geoip2.continent_names
-- geoip2.continent_geoname_id
-- geoip2.continent_name
-- geoip2.city_confidence
-- geoip2.city_locales
-- geoip2.city_names
-- geoip2.city_geoname_id
-- geoip2.city_name
-- geoip2.location_latitude
-- geoip2.location_longitude
-- geoip2.location_time_zone
-- geoip2.location_accuracy_radius
-- geoip2.location_average_income
-- geoip2.location_metro_code
-- geoip2.location_population_density
-- geoip2.postal_code
-- geoip2.postal_confidence
-- geoip2.registeredcountry_geoname_id
-- geoip2.registeredcountry_is_in_european_union
-- geoip2.registeredcountry_iso_code
-- geoip2.registeredcountry_names
-- geoip2.registeredcountry_name
-- geoip2.representedcountry_geoname_id
-- geoip2.representedcountry_is_in_european_union	
-- geoip2.representedcountry_iso_code
-- geoip2.representedcountry_names
-- geoip2.representedcountry_locales
-- geoip2.representedcountry_confidence
-- geoip2.representedcountry_type
-- geoip2.representedcountry_name
-- geoip2.traits_is_anonymous_proxy
-- geoip2.traits_is_anonymous_vpn
-- geoip2.traits_is_satellite_provider
-- geoip2.traits_autonomous_system_number
-- geoip2.traits_autonomous_system_organization
-- geoip2.traits_autonomous_system_organization
-- geoip2.traits_autonomous_system_organization
-- geoip2.traits_connection_type
-- geoip2.traits_domain
-- geoip2.traits_is_hosting_provider
-- geoip2.traits_is_legitimate_proxy
-- geoip2.traits_is_public_proxy
-- geoip2.traits_is_residential_proxy
-- geoip2.traits_is_tor_exit_node
-- geoip2.traits_isp
-- geoip2.traits_mobile_country_code
-- geoip2.traits_mobile_network_code
-- geoip2.traits_network
-- geoip2.traits_organization
-- geoip2.traits_user_type
-- geoip2.traits_userCount
-- geoip2.traits_static_ip_score
+```caddyfile
+{
+  geoip2 {
+    database_path /var/lib/geoip/GeoLite2-City.mmdb
+    reload_interval weekly
+  }
+}
 
-## ref
+example.com {
+  geoip2_vars trusted_proxies
+  
+  log {
+    output file /var/log/caddy/geo.log
+    format json
+    append {
+      # Geographic data
+      geo_country {geoip2_country_code}
+      geo_city {geoip2_city}
+      geo_lat {geoip2_latitude}
+      geo_lng {geoip2_longitude}
+      geo_subdivision {geoip2_subdivisions}
+      geo_eu {geoip2_is_in_eu}
+      
+      # Network data
+      asn {geoip2_asn}
+      as_org {geoip2_asorg}
+      
+      # Request data
+      user_agent {>User-Agent}
+      real_ip {remote_host}
+    }
+  }
+  
+  reverse_proxy backend:8080
+}
+```
 
-- https://github.com/caddyserver/caddy
-- https://github.com/maxmind/geoipupdate
-- https://github.com/shift72/caddy-geo-ip
-- https://github.com/aablinov/caddy-geoip
-- https://github.com/zhangjiayin/caddy-mysql-adapter
-- https://github.com/zhangjiayin/caddy-mysql-storage
+## Understanding Execution Order
+
+### Why Order Matters
+
+**GeoIP2 is a middleware** that sets variables, but **directives** (like `header`, `log`, `respond`) need those variables to be available:
+
+```caddyfile
+{
+  # GeoIP2 middleware must run BEFORE directives that use the variables
+  order geoip2_vars before header
+  # Alternative: order geoip2_vars first (runs before everything)
+}
+
+example.com {
+  # 1. geoip2_vars middleware runs first → sets variables
+  geoip2_vars strict
+  
+  # 2. Then header directive can use the variables
+  header Country-Code "{geoip2_country_code}"  # ✅ Variable available
+  
+  # 3. respond directive can also use them
+  respond "Hello from {geoip2_city}!"  # ✅ Variable available
+}
+```
+
+### Common Order Configurations
+
+```caddyfile
+# Option 1: Run before specific directives
+order geoip2_vars before header
+
+# Option 2: Run first (safest, works with everything)
+order geoip2_vars first
+
+# Option 3: Run before multiple directives
+order geoip2_vars before header rewrite respond
+```
+
+### What Happens Without Correct Order
+
+```caddyfile
+# ❌ BAD: No order specified
+example.com {
+  header Country-Code "{geoip2_country_code}"  # Variable = "" (empty)
+  geoip2_vars strict                           # Runs too late!
+}
+
+# ✅ GOOD: Correct order
+{
+  order geoip2_vars before header
+}
+example.com {
+  geoip2_vars strict                           # Sets variables first
+  header Country-Code "{geoip2_country_code}"  # Variable has value
+}
+```
+
+## IP Detection Modes
+
+### `strict` Mode
+- **Use case**: High-security environments, direct connections
+- **Behavior**: Only uses `RemoteAddr`, ignores all forwarded headers
+- **Pros**: Most secure, no spoofing possible
+- **Cons**: Won't work behind proxies/load balancers
+
+### `trusted_proxies` Mode (Default)
+- **Use case**: Production with known proxy infrastructure
+- **Behavior**: Uses `X-Forwarded-For` only from Caddy's trusted proxies
+- **Pros**: Secure and works with proper proxy setup
+- **Cons**: Requires correct `trusted_proxies` configuration
+
+### `wild` Mode
+- **Use case**: Development, testing, or when you can't control proxy headers
+- **Behavior**: Trusts any `X-Forwarded-For` header
+- **Pros**: Works everywhere, easy setup
+- **Cons**: Vulnerable to IP spoofing
+
+## Database Reload Options
+
+| Value | Description |
+|-------|-------------|
+| `daily` or `24h` | Reload every 24 hours |
+| `weekly` or `168h` | Reload every 7 days |
+| `48` | Reload every 48 hours |
+| `off` or `0` | No automatic reload |
+
+## Performance Optimizations
+
+1. **Minimal Structure**: Only parses fields you actually use
+2. **Constant Variables**: Uses constants for variable names (compiler optimization)
+3. **Method Decomposition**: Separates concerns for better caching
+4. **Smart Fallbacks**: English city names with fallback to any available language
+5. **Early Returns**: Fails fast on errors without unnecessary processing
+6. **Read Locks**: Multiple concurrent lookups without blocking
+
+## Database Compatibility
+
+Works with MaxMind databases:
+- **GeoLite2-City** (free, recommended)
+- **GeoIP2-City** (commercial)
+- **GeoLite2-Country** (limited data)
+- **GeoIP2-Country** (limited data)
+
+## Error Handling
+
+The module gracefully handles:
+- Missing database files
+- Corrupted databases  
+- Invalid IP addresses
+- Database reload failures
+- Network interruptions
+
+Variables are always available (empty strings if lookup fails) to prevent template errors.
+
+## Monitoring
+
+You can monitor the GeoIP2 module via Caddy's admin API:
+
+```bash
+# Check current status
+curl localhost:2019/config/apps/geoip2
+
+# Reload database manually
+curl -X POST localhost:2019/load \
+  -H "Content-Type: application/json" \
+  -d '{"module": "geoip2"}'
+```
+
+## License
+
+This project is licensed under the Apache License 2.0.
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## References
+
+- [Caddy Documentation](https://caddyserver.com/docs/)
+- [MaxMind GeoIP2 Documentation](https://dev.maxmind.com/geoip/docs/)
+- [MaxMind Database Format](https://maxmind.github.io/MaxMind-DB/)

@@ -1,135 +1,92 @@
 package geoip2
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
+// GeoIP2Record defines the minimal structure needed from MaxMind database
+// Only includes the fields we actually use to minimize memory allocation
 type GeoIP2Record struct {
 	Country struct {
-		Locales           []string          `json:"locales"`
-		Confidence        uint16            `maxminddb:"confidence"`
-		ISOCode           string            `maxminddb:"iso_code"`
-		IsInEuropeanUnion bool              `maxminddb:"is_in_european_union"`
-		Names             map[string]string `maxminddb:"names"`
-		GeoNameID         uint64            `maxminddb:"geoname_id"`
+		ISOCode           string `maxminddb:"iso_code"`             // Two-letter country code (e.g., "DE", "US")
+		IsInEuropeanUnion bool   `maxminddb:"is_in_european_union"` // Whether country is in EU
 	} `maxminddb:"country"`
 
-	Continent struct {
-		Locales   []string          `json:"locales"`
-		Code      string            `maxminddb:"code"`
-		GeoNameID uint              `maxminddb:"geoname_id"`
-		Names     map[string]string `maxminddb:"names"`
-	} `maxminddb:"continent"`
-
 	City struct {
-		Names      map[string]string `maxminddb:"names"`
-		Confidence uint16            `maxminddb:"confidence"`
-		GeoNameID  uint64            `maxminddb:"geoname_id"`
-		Locales    []string          `json:"locales"`
+		Names map[string]string `maxminddb:"names"` // City names in different languages
 	} `maxminddb:"city"`
 
 	Location struct {
-		AccuracyRadius    uint16  `maxminddb:"accuracy_radius"`
-		AverageIncome     uint16  `maxminddb:"average_income"`
-		Latitude          float64 `maxminddb:"latitude"`
-		Longitude         float64 `maxminddb:"longitude"`
-		MetroCode         uint    `maxminddb:"metro_code"`
-		PopulationDensity uint    `maxminddb:"population_density"`
-		TimeZone          string  `maxminddb:"time_zone"`
+		Latitude  float64 `maxminddb:"latitude"`  // Geographic latitude
+		Longitude float64 `maxminddb:"longitude"` // Geographic longitude
 	} `maxminddb:"location"`
 
-	Postal struct {
-		Code       string `maxminddb:"code"`
-		Confidence uint16 `maxminddb:"confidence"`
-	} `maxminddb:"postal"`
-
-	RegisteredCountry struct {
-		GeoNameID         uint              `maxminddb:"geoname_id"`
-		IsInEuropeanUnion bool              `maxminddb:"is_in_european_union"`
-		IsoCode           string            `maxminddb:"iso_code"`
-		Names             map[string]string `maxminddb:"names"`
-	} `maxminddb:"registered_country"`
-
-	RepresentedCountry struct {
-		Locales           []string          `json:"locales"`
-		Confidence        uint16            `maxminddb:"confidence"`
-		GeoNameID         uint              `maxminddb:"geoname_id"`
-		IsInEuropeanUnion bool              `maxminddb:"is_in_european_union"`
-		IsoCode           string            `maxminddb:"iso_code"`
-		Names             map[string]string `maxminddb:"names"`
-		Type              string            `maxminddb:"type"`
-	} `maxminddb:"represented_country"`
-
 	Subdivisions []struct {
-		Locales    []string          `json:"locales"`
-		Confidence uint16            `maxminddb:"confidence"`
-		GeoNameID  uint              `maxminddb:"geoname_id"`
-		IsoCode    string            `maxminddb:"iso_code"`
-		Names      map[string]string `maxminddb:"names"`
+		IsoCode string `maxminddb:"iso_code"` // State/Province code (e.g., "CA", "BY")
 	} `maxminddb:"subdivisions"`
 
 	Traits struct {
-		IsAnonymousProxy    bool `maxminddb:"is_anonymous_proxy"`
-		IsAnonymousVpn      bool `maxminddb:"is_anonymous_vpn"`
-		IsSatelliteProvider bool `maxminddb:"is_satellite_provider"`
-
-		AutonomousSystemNumber       uint64 `maxminddb:"autonomous_system_number"`
-		AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"`
-		ConnectionType               string `maxminddb:"connection_type"`
-		Domain                       string `maxminddb:"domain"`
-
-		IsHostingProvider  bool    `maxminddb:"is_hosting_provider"`
-		IsLegitimateProxy  bool    `maxminddb:"is_legitimate_proxy"`
-		IsPublicProxy      bool    `maxminddb:"is_public_proxy"`
-		IsResidentialProxy bool    `maxminddb:"is_residential_proxy"`
-		IsTorExitNode      bool    `maxminddb:"is_tor_exit_node"`
-		Isp                string  `maxminddb:"isp"`
-		MobileCountryCode  string  `maxminddb:"mobile_country_code"`
-		MobileNetworkCode  string  `maxminddb:"mobile_network_code"`
-		Network            string  `maxminddb:"network"`
-		Organization       string  `maxminddb:"organization"`
-		UserType           string  `maxminddb:"user_type"`
-		UserCount          int32   `maxminddb:"userCount"`
-		StaticIpScore      float64 `maxminddb:"static_ip_score"`
+		AutonomousSystemNumber       uint64 `maxminddb:"autonomous_system_number"`       // ASN number
+		AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"` // ASN organization name
 	} `maxminddb:"traits"`
 }
 
-// http.handlers.geoip2 is an GeoIP2 server handler.
-// it uses GeoIP2 Data to identify the location of the IP
+// GeoIP2 is the HTTP middleware handler that provides GeoIP2 functionality
+// It enriches requests with geographic information based on client IP
 type GeoIP2 struct {
-	// strict: only use remote IP address
-	// wild: use X-Forwarded-For if it exists
-	// trusted_proxies: use X-Forwarded-For if exists when trusted_proxies if valid
-	// default:trusted_proxies
-	Enable string        `json:"enable,omitempty"`
-	state  *GeoIP2State  `json:"-"`
-	ctx    caddy.Context `json:"-"`
+	// Enable controls the IP detection mode:
+	// - "strict": only use remote IP address (ignore X-Forwarded-For)
+	// - "wild": trust X-Forwarded-For header unconditionally
+	// - "trusted_proxies": trust X-Forwarded-For only from trusted proxies (default)
+	// - "off"/"false"/"0": disable GeoIP2 lookups
+	Enable string `json:"enable,omitempty"`
+	
+	// state holds reference to the shared GeoIP2 database state
+	state *GeoIP2State `json:"-"`
+	
+	// ctx is the Caddy context for this module instance
+	ctx caddy.Context `json:"-"`
 }
 
+// IpSafeLevel defines the security level for IP address detection
 type IpSafeLevel int
 
 const (
-	Wild           IpSafeLevel = 0
-	TrustedProxies IpSafeLevel = 1
-	Strict         IpSafeLevel = 100
+	Wild           IpSafeLevel = 0   // Trust any X-Forwarded-For header
+	TrustedProxies IpSafeLevel = 1   // Only trust X-Forwarded-For from trusted proxies
+	Strict         IpSafeLevel = 100 // Never trust X-Forwarded-For, use RemoteAddr only
 )
 
+// Variable names that will be set in Caddy's replacer
+// Using underscore notation instead of dots for better compatibility
+const (
+	VarCity         = "geoip2_city"
+	VarCountryCode  = "geoip2_country_code"
+	VarLatitude     = "geoip2_latitude"
+	VarLongitude    = "geoip2_longitude"
+	VarSubdivisions = "geoip2_subdivisions"
+	VarIsInEU       = "geoip2_is_in_eu"
+	VarASN          = "geoip2_asn"
+	VarASOrg        = "geoip2_asorg"
+)
+
+// Module registration - called when Caddy starts
 func init() {
 	caddy.RegisterModule(GeoIP2{})
 	httpcaddyfile.RegisterHandlerDirective("geoip2_vars", parseCaddyfile)
 }
 
+// CaddyModule returns module information for Caddy's module system
 func (GeoIP2) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.geoip2",
@@ -137,313 +94,179 @@ func (GeoIP2) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// ServeHTTP implements the HTTP middleware interface
+// This is called for every HTTP request that passes through this middleware
 func (m GeoIP2) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	// Get Caddy's replacer to set variables that can be used in config
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	//init some variables with default value ""
-	repl.Set("geoip2.ip_address", "")
-	repl.Set("geoip2.country_code", "")
-	repl.Set("geoip2.country_name", "")
-	repl.Set("geoip2.country_eu", "")
-	repl.Set("geoip2.country_locales", "")
-	repl.Set("geoip2.country_confidence", "")
-	repl.Set("geoip2.country_names", "")
+	
+	// Initialize all GeoIP2 variables with empty defaults
+	// This ensures they're always available even if lookup fails
+	m.initializeVariables(repl)
 
-	repl.Set("geoip2.country_names_0", "")
-	repl.Set("geoip2.country_names_1", "")
-	repl.Set("geoip2.country_geoname_id", "")
-	repl.Set("geoip2.continent_code", "")
-	repl.Set("geoip2.continent_locales", "")
-	repl.Set("geoip2.continent_names", "")
-
-	repl.Set("geoip2.continent_names_0", "")
-	repl.Set("geoip2.continent_names_1", "")
-
-	repl.Set("geoip2.continent_geoname_id", "")
-	repl.Set("geoip2.continent_name", "")
-	repl.Set("geoip2.city_confidence", "")
-	repl.Set("geoip2.city_locales", "")
-	repl.Set("geoip2.city_names", "")
-	repl.Set("geoip2.city_names_0", "")
-	repl.Set("geoip2.city_names_1", "")
-	repl.Set("geoip2.city_geoname_id", "")
-	// repl.Set("geoip2.city_name", val)
-	repl.Set("geoip2.city_name", "")
-	repl.Set("geoip2.location_latitude", "")
-	repl.Set("geoip2.location_longitude", "")
-	repl.Set("geoip2.location_time_zone", "")
-	repl.Set("geoip2.location_accuracy_radius", "")
-	repl.Set("geoip2.location_average_income", "")
-	repl.Set("geoip2.location_metro_code", "")
-	repl.Set("geoip2.location_population_density", "")
-	repl.Set("geoip2.postal_code", "")
-	repl.Set("geoip2.postal_confidence", "")
-	repl.Set("geoip2.registeredcountry_geoname_id", "")
-	repl.Set("geoip2.registeredcountry_is_in_european_union", "")
-	repl.Set("geoip2.registeredcountry_iso_code", "")
-	repl.Set("geoip2.registeredcountry_names", "")
-	repl.Set("geoip2.registeredcountry_names_0", "")
-	repl.Set("geoip2.registeredcountry_names_1", "")
-
-	repl.Set("geoip2.registeredcountry_name", "")
-	repl.Set("geoip2.representedcountry_geoname_id", "")
-	repl.Set("geoip2.representedcountry_is_in_european_union", "")
-	repl.Set("geoip2.representedcountry_iso_code", "")
-	repl.Set("geoip2.representedcountry_names", "")
-	repl.Set("geoip2.representedcountry_locales", "")
-	repl.Set("geoip2.representedcountry_confidence", "")
-	repl.Set("geoip2.representedcountry_type", "")
-	repl.Set("geoip2.representedcountry_name", "")
-	repl.Set("geoip2.representedcountry_names_0", "")
-	repl.Set("geoip2.representedcountry_names_1", "")
-	repl.Set("geoip2.subdivisions", "")
-	repl.Set("geoip2.traits_is_anonymous_proxy", "")
-	repl.Set("geoip2.traits_is_anonymous_vpn", "")
-	repl.Set("geoip2.traits_is_satellite_provider", "")
-	repl.Set("geoip2.traits_autonomous_system_number", "")
-	repl.Set("geoip2.traits_autonomous_system_organization", "")
-	repl.Set("geoip2.traits_connection_type", "")
-	repl.Set("geoip2.traits_domain", "")
-	repl.Set("geoip2.traits_is_hosting_provider", "")
-	repl.Set("geoip2.traits_is_legitimate_proxy", "")
-	repl.Set("geoip2.traits_is_public_proxy", "")
-	repl.Set("geoip2.traits_is_residential_proxy", "")
-	repl.Set("geoip2.traits_is_tor_exit_node", "")
-	repl.Set("geoip2.traits_isp", "")
-	repl.Set("geoip2.traits_mobile_country_code", "")
-	repl.Set("geoip2.traits_mobile_network_code", "")
-	repl.Set("geoip2.traits_network", "")
-	repl.Set("geoip2.traits_organization", "")
-	repl.Set("geoip2.traits_user_type", "")
-	repl.Set("geoip2.traits_userCount", "")
-	repl.Set("geoip2.traits_static_ip_score", "")
-
-	repl.Set("geoip2.subdivisions_1_confidence", "")
-	repl.Set("geoip2.subdivisions_1_geoname_id", "")
-	repl.Set("geoip2.subdivisions_1_iso_code", "")
-	repl.Set("geoip2.subdivisions_1_locales", "")
-	repl.Set("geoip2.subdivisions_1_locales_en", "")
-	repl.Set("geoip2.subdivisions_1_names", "")
-	repl.Set("geoip2.subdivisions_1_names_0", "")
-	repl.Set("geoip2.subdivisions_1_names_1", "")
-	repl.Set("geoip2.subdivisions_1_name", "")
-
-	repl.Set("geoip2.subdivisions_2_confidence", "")
-	repl.Set("geoip2.subdivisions_2_geoname_id", "")
-	repl.Set("geoip2.subdivisions_2_iso_code", "")
-	repl.Set("geoip2.subdivisions_2_locales", "")
-	repl.Set("geoip2.subdivisions_2_locales_en", "")
-	repl.Set("geoip2.subdivisions_2_names", "")
-	repl.Set("geoip2.subdivisions_2_names_0", "")
-	repl.Set("geoip2.subdivisions_2_names_1", "")
-	repl.Set("geoip2.subdivisions_2_name", "")
-
-	if m.Enable != "off" && m.Enable != "false" && m.Enable != "0" {
-		var record = GeoIP2Record{}
-		if m.state != nil && m.state.DBHandler != nil {
-
-			clientIP, _ := m.getClientIP(r)
-			m.state.DBHandler.Lookup(clientIP, &record)
-
-			if clientIP == nil {
-				repl.Set("geoip2.ip_address", "")
-			} else {
-				repl.Set("geoip2.ip_address", clientIP.String())
-			}
-
-			//country
-			repl.Set("geoip2.country_code", record.Country.ISOCode)
-
-			for key, element := range record.Country.Names {
-				repl.Set("geoip2.country_names_"+key, element)
-				if key == "en" {
-					repl.Set("geoip2.country_name", element)
-				}
-			}
-
-			repl.Set("geoip2.country_eu", record.Country.IsInEuropeanUnion)
-			repl.Set("geoip2.country_locales", record.Country.Locales)
-			repl.Set("geoip2.country_confidence", record.Country.Confidence)
-			repl.Set("geoip2.country_names", record.Country.Names)
-			repl.Set("geoip2.country_geoname_id", record.Country.GeoNameID)
-
-			//Continent
-			repl.Set("geoip2.continent_code", record.Continent.Code)
-			repl.Set("geoip2.continent_locales", record.Continent.Locales)
-			repl.Set("geoip2.continent_names", record.Continent.Names)
-			repl.Set("geoip2.continent_geoname_id", record.Continent.GeoNameID)
-
-			for key, element := range record.Continent.Names {
-				repl.Set("geoip2.continent_names_"+key, element)
-				if key == "en" {
-					repl.Set("geoip2.continent_name", element)
-				}
-			}
-
-			//City
-			repl.Set("geoip2.city_confidence", record.City.Confidence)
-			repl.Set("geoip2.city_locales", record.City.Locales)
-			repl.Set("geoip2.city_names", record.City.Names)
-			repl.Set("geoip2.city_geoname_id", record.City.GeoNameID)
-			// val, _ = record.City.Names["en"]
-			// repl.Set("geoip2.city_name", val)
-
-			for key, element := range record.City.Names {
-				repl.Set("geoip2.city_names_"+key, element)
-				if key == "en" {
-					repl.Set("geoip2.city_name", element)
-				}
-			}
-
-			//Location
-			repl.Set("geoip2.location_latitude", record.Location.Latitude)
-			repl.Set("geoip2.location_longitude", record.Location.Longitude)
-			repl.Set("geoip2.location_time_zone", record.Location.TimeZone)
-			repl.Set("geoip2.location_accuracy_radius", record.Location.AccuracyRadius)
-			repl.Set("geoip2.location_average_income", record.Location.AverageIncome)
-			repl.Set("geoip2.location_metro_code", record.Location.MetroCode)
-			repl.Set("geoip2.location_population_density", record.Location.PopulationDensity)
-
-			//Postal
-			repl.Set("geoip2.postal_code", record.Postal.Code)
-			repl.Set("geoip2.postal_confidence", record.Postal.Confidence)
-
-			//RegisteredCountry
-			repl.Set("geoip2.registeredcountry_geoname_id", record.RegisteredCountry.GeoNameID)
-			repl.Set("geoip2.registeredcountry_is_in_european_union", record.RegisteredCountry.IsInEuropeanUnion)
-			repl.Set("geoip2.registeredcountry_iso_code", record.RegisteredCountry.IsoCode)
-			repl.Set("geoip2.registeredcountry_names", record.RegisteredCountry.Names)
-			// val, _ = record.RegisteredCountry.Names["en"]
-			// repl.Set("geoip2.registeredcountry_name", val)
-
-			for key, element := range record.RegisteredCountry.Names {
-				repl.Set("geoip2.registeredcountry_names_"+key, element)
-				if key == "en" {
-					repl.Set("geoip2.registeredcountry_name", element)
-				}
-			}
-
-			//RepresentedCountry
-			repl.Set("geoip2.representedcountry_geoname_id", record.RepresentedCountry.GeoNameID)
-			repl.Set("geoip2.representedcountry_is_in_european_union", record.RepresentedCountry.IsInEuropeanUnion)
-			repl.Set("geoip2.representedcountry_iso_code", record.RepresentedCountry.IsoCode)
-			repl.Set("geoip2.representedcountry_names", record.RepresentedCountry.Names)
-			repl.Set("geoip2.representedcountry_locales", record.RepresentedCountry.Locales)
-			repl.Set("geoip2.representedcountry_confidence", record.RepresentedCountry.Confidence)
-			repl.Set("geoip2.representedcountry_type", record.RepresentedCountry.Type)
-			// val, _ = record.RepresentedCountry.Names["en"]
-			// repl.Set("geoip2.representedcountry_name", val)
-
-			for key, element := range record.RepresentedCountry.Names {
-				repl.Set("geoip2.representedcountry_names_"+key, element)
-				if key == "en" {
-					repl.Set("geoip2.representedcountry_name", element)
-				}
-			}
-
-			repl.Set("geoip2.subdivisions", record.Subdivisions)
-
-			for index, subdivision := range record.Subdivisions {
-				indexStr := strconv.Itoa(index + 1)
-				repl.Set("geoip2.subdivisions_"+indexStr+"_confidence", subdivision.Confidence)
-				repl.Set("geoip2.subdivisions_"+indexStr+"_geoname_id", subdivision.GeoNameID)
-				repl.Set("geoip2.subdivisions_"+indexStr+"_iso_code", subdivision.IsoCode)
-				repl.Set("geoip2.subdivisions_"+indexStr+"_locales", subdivision.Locales)
-				repl.Set("geoip2.subdivisions_"+indexStr+"_names", subdivision.Names)
-				for key, element := range subdivision.Locales {
-					keyStr := strconv.Itoa(key)
-					repl.Set("geoip2.subdivisions_"+indexStr+"_locales_"+keyStr, element)
-				}
-				for key, element := range subdivision.Names {
-					repl.Set("geoip2.subdivisions_"+indexStr+"_names_"+key, element)
-					if key == "en" {
-						repl.Set("geoip2.subdivisions_"+indexStr+"_name", element)
-					}
-				}
-			}
-
-			//Traits
-			repl.Set("geoip2.traits_is_anonymous_proxy", record.Traits.IsAnonymousProxy)
-			repl.Set("geoip2.traits_is_anonymous_vpn", record.Traits.IsAnonymousVpn)
-			repl.Set("geoip2.traits_is_satellite_provider", record.Traits.IsSatelliteProvider)
-			repl.Set("geoip2.traits_autonomous_system_number", record.Traits.AutonomousSystemNumber)
-			repl.Set("geoip2.traits_autonomous_system_organization", record.Traits.AutonomousSystemOrganization)
-
-			//Traits
-			repl.Set("geoip2.traits_connection_type", record.Traits.ConnectionType)
-			repl.Set("geoip2.traits_domain", record.Traits.Domain)
-			repl.Set("geoip2.traits_is_hosting_provider", record.Traits.IsHostingProvider)
-			repl.Set("geoip2.traits_is_legitimate_proxy", record.Traits.IsLegitimateProxy)
-			repl.Set("geoip2.traits_is_public_proxy", record.Traits.IsPublicProxy)
-			repl.Set("geoip2.traits_is_residential_proxy", record.Traits.IsResidentialProxy)
-			repl.Set("geoip2.traits_is_tor_exit_node", record.Traits.IsTorExitNode)
-			repl.Set("geoip2.traits_isp", record.Traits.Isp)
-			repl.Set("geoip2.traits_mobile_country_code", record.Traits.MobileCountryCode)
-			repl.Set("geoip2.traits_mobile_network_code", record.Traits.MobileNetworkCode)
-			repl.Set("geoip2.traits_network", record.Traits.Network)
-			repl.Set("geoip2.traits_organization", record.Traits.Organization)
-			repl.Set("geoip2.traits_user_type", record.Traits.UserType)
-			repl.Set("geoip2.traits_userCount", record.Traits.UserCount)
-			repl.Set("geoip2.traits_static_ip_score", record.Traits.StaticIpScore)
-
-			caddy.Log().Named("http.handlers.geoip2").Debug(fmt.Sprintf("ServeHTTP %v %v %v", m, record, clientIP))
-		}
-
+	// Only perform lookup if GeoIP2 is enabled
+	if m.isEnabled() {
+		// Try to perform GeoIP2 lookup and populate variables
+		m.performLookup(r, repl)
 	}
+
+	// Continue to next handler in chain
 	return next.ServeHTTP(w, r)
 }
 
-func (m GeoIP2) getClientIP(r *http.Request) (net.IP, error) {
-	var ip string
+// initializeVariables sets all GeoIP2 variables to empty defaults
+// This prevents undefined variable errors in Caddy config
+func (m *GeoIP2) initializeVariables(repl *caddy.Replacer) {
+	repl.Set(VarCity, "")
+	repl.Set(VarCountryCode, "")
+	repl.Set(VarLatitude, "")
+	repl.Set(VarLongitude, "")
+	repl.Set(VarSubdivisions, "")
+	repl.Set(VarIsInEU, "")
+	repl.Set(VarASN, "")
+	repl.Set(VarASOrg, "")
+}
 
-	trustedProxy := caddyhttp.GetVar(r.Context(), caddyhttp.TrustedProxyVarKey).(bool)
+// isEnabled checks if GeoIP2 lookups should be performed
+func (m *GeoIP2) isEnabled() bool {
+	return m.Enable != "off" && m.Enable != "false" && m.Enable != "0"
+}
 
-	safeLevel := TrustedProxies
-
-	if strings.ToLower(m.Enable) == "strict" {
-		safeLevel = Strict
-	} else if strings.ToLower(m.Enable) == "wild" {
-		safeLevel = Wild
+// performLookup does the actual GeoIP2 database lookup and sets variables
+func (m *GeoIP2) performLookup(r *http.Request, repl *caddy.Replacer) {
+	// Check if database is available
+	if m.state == nil || m.state.DBHandler == nil {
+		caddy.Log().Named("http.handlers.geoip2").Warn("GeoIP2 database not available")
+		return
 	}
 
-	fwdFor := r.Header.Get("X-Forwarded-For")
+	// Get client IP address based on configured safety level
+	clientIP, err := m.getClientIP(r)
+	if err != nil {
+		caddy.Log().Named("http.handlers.geoip2").Debug("failed to get client IP", 
+			zap.Error(err))
+		return
+	}
 
-	if ((safeLevel == TrustedProxies && trustedProxy) || safeLevel == Wild) && fwdFor != "" {
-		ips := strings.Split(fwdFor, ", ")
-		ip = ips[0]
+	// Perform database lookup
+	var record GeoIP2Record
+	if err := m.state.Lookup(clientIP, &record); err != nil {
+		caddy.Log().Named("http.handlers.geoip2").Debug("GeoIP2 lookup failed",
+			zap.String("ip", clientIP.String()),
+			zap.Error(err))
+		return
+	}
+
+	// Populate replacer variables with lookup results
+	m.setGeoIPVariables(repl, &record)
+
+	// Debug logging
+	caddy.Log().Named("http.handlers.geoip2").Debug("GeoIP2 lookup successful",
+		zap.String("ip", clientIP.String()),
+		zap.String("country", record.Country.ISOCode),
+		zap.String("city", record.City.Names["en"]))
+}
+
+// setGeoIPVariables populates all GeoIP2 variables from the lookup result
+func (m *GeoIP2) setGeoIPVariables(repl *caddy.Replacer, record *GeoIP2Record) {
+	// Basic country information
+	repl.Set(VarCountryCode, record.Country.ISOCode)
+	repl.Set(VarIsInEU, record.Country.IsInEuropeanUnion)
+	
+	// Geographic coordinates
+	repl.Set(VarLatitude, record.Location.Latitude)
+	repl.Set(VarLongitude, record.Location.Longitude)
+	
+	// Network information (ASN)
+	repl.Set(VarASN, record.Traits.AutonomousSystemNumber)
+	repl.Set(VarASOrg, record.Traits.AutonomousSystemOrganization)
+
+	// City name (prefer English, fallback to any available)
+	if cityName, exists := record.City.Names["en"]; exists && cityName != "" {
+		repl.Set(VarCity, cityName)
 	} else {
-		// Otherwise, get the client ip from the request remote address.
+		// If no English name, try to get any available city name
+		for _, name := range record.City.Names {
+			if name != "" {
+				repl.Set(VarCity, name)
+				break
+			}
+		}
+	}
+
+	// Subdivisions (state/province) - use first available
+	if len(record.Subdivisions) > 0 && record.Subdivisions[0].IsoCode != "" {
+		repl.Set(VarSubdivisions, record.Subdivisions[0].IsoCode)
+	}
+}
+
+// getClientIP determines the real client IP address based on configuration
+// Handles X-Forwarded-For header according to security settings
+func (m GeoIP2) getClientIP(r *http.Request) (net.IP, error) {
+	var ipStr string
+
+	// Determine if we're behind a trusted proxy
+	trustedProxy := caddyhttp.GetVar(r.Context(), caddyhttp.TrustedProxyVarKey).(bool)
+
+	// Convert string setting to safety level
+	safeLevel := m.getSafetyLevel()
+
+	// Get X-Forwarded-For header if present
+	forwardedFor := r.Header.Get("X-Forwarded-For")
+
+	// Decide which IP to use based on safety level and proxy trust
+	if ((safeLevel == TrustedProxies && trustedProxy) || safeLevel == Wild) && forwardedFor != "" {
+		// Use X-Forwarded-For header (take first IP in chain)
+		ips := strings.Split(forwardedFor, ", ")
+		ipStr = strings.TrimSpace(ips[0])
+	} else {
+		// Use direct connection IP from RemoteAddr
 		var err error
-		ip, _, err = net.SplitHostPort(r.RemoteAddr)
+		ipStr, _, err = net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
-			if serr, ok := err.(*net.AddrError); ok && serr.Err == "missing port in address" { // It's not critical try parse
-				ip = r.RemoteAddr
+			// Handle case where RemoteAddr doesn't have port
+			if serr, ok := err.(*net.AddrError); ok && serr.Err == "missing port in address" {
+				ipStr = r.RemoteAddr
 			} else {
-				log.Printf("Error when SplitHostPort: %v", serr.Err)
+				log.Printf("Error parsing RemoteAddr: %v", err)
 				return nil, err
 			}
 		}
 	}
 
-	// Parse the ip address string into a net.IP.
-	parsedIP := net.ParseIP(ip)
+	// Parse and validate IP address
+	parsedIP := net.ParseIP(ipStr)
 	if parsedIP == nil {
-		return nil, errors.New("unable to parse address")
+		return nil, fmt.Errorf("invalid IP address: %s", ipStr)
 	}
 
 	return parsedIP, nil
 }
 
-// for http handler
+// getSafetyLevel converts string configuration to IpSafeLevel enum
+func (m *GeoIP2) getSafetyLevel() IpSafeLevel {
+	switch strings.ToLower(m.Enable) {
+	case "strict":
+		return Strict
+	case "wild":
+		return Wild
+	default:
+		return TrustedProxies
+	}
+}
+
+// parseCaddyfile parses the Caddyfile directive for this handler
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m GeoIP2
 	err := m.UnmarshalCaddyfile(h.Dispenser)
 	return m, err
-
 }
 
-// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler
+// Parses: geoip2_vars <mode>
 func (m *GeoIP2) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
+		// Parse the mode argument (strict/wild/trusted_proxies)
 		if !d.Args(&m.Enable) {
 			return d.ArgErr()
 		}
@@ -451,22 +274,41 @@ func (m *GeoIP2) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// Provision sets up the module with Caddy context
+// Links this handler to the shared GeoIP2 database state
 func (g *GeoIP2) Provision(ctx caddy.Context) error {
-	caddy.Log().Named("http.handlers.geoip2").Info(fmt.Sprintf("Provision"))
+	caddy.Log().Named("http.handlers.geoip2").Debug("provisioning GeoIP2 handler")
+	
+	// Get reference to the shared GeoIP2 app/state
 	app, err := ctx.App(moduleName)
 	if err != nil {
 		return fmt.Errorf("getting geoip2 app: %v", err)
 	}
+	
+	// Store reference to shared state
 	g.state = app.(*GeoIP2State)
 	g.ctx = ctx
-	return nil
-}
-func (g GeoIP2) Validate() error {
-	caddy.Log().Named("http.handlers.geoip2").Info(fmt.Sprintf("Validate"))
+	
 	return nil
 }
 
-// Interface guards
+// Validate checks if the configuration is valid
+func (g GeoIP2) Validate() error {
+	caddy.Log().Named("http.handlers.geoip2").Debug("validating GeoIP2 handler")
+	
+	// Validate Enable setting
+	validModes := []string{"strict", "wild", "trusted_proxies", "off", "false", "0", ""}
+	mode := strings.ToLower(g.Enable)
+	for _, valid := range validModes {
+		if mode == valid {
+			return nil
+		}
+	}
+	
+	return fmt.Errorf("invalid enable mode '%s', must be one of: %v", g.Enable, validModes)
+}
+
+// Interface guards - compile-time checks that we implement required interfaces
 var (
 	_ caddy.Module                = (*GeoIP2)(nil)
 	_ caddy.Provisioner           = (*GeoIP2)(nil)

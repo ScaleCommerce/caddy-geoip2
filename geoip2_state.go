@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,45 +15,53 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	"github.com/maxmind/geoipupdate/v4/pkg/geoipupdate"
-	"github.com/maxmind/geoipupdate/v4/pkg/geoipupdate/database"
 	"github.com/oschwald/maxminddb-golang"
+	"go.uber.org/zap"
 )
 
-// geoip2 is global caddy app with http.handlers.geoip2
-// it update geoip2 data automatically by the params
+// GeoIP2State manages the shared GeoIP2 database state across all handler instances
+// This is a Caddy app that provides centralized database management with features like:
+// - Thread-safe database access
+// - Automatic database reloading
+// - Shared state across multiple handler instances
 type GeoIP2State struct {
+	// DBHandler is the MaxMind database reader instance
+	// Protected by mutex for thread-safe access
 	DBHandler *maxminddb.Reader `json:"-"`
-	mutex     *sync.Mutex       `json:"-"`
-	// Your MaxMind account ID. This was formerly known as UserId.
-	AccountID int `json:"accountId,omitempty"`
-	// The directory to store the database files. Defaults to DATADIR
-	DatabaseDirectory string `json:"databaseDirectory,omitempty"`
-	// Your case-sensitive MaxMind license key.
-	LicenseKey string `json:"licenseKey,omitempty"`
-	// The lock file to use. This ensures only one geoipupdate process can run at a
-	// time.
-	// Note: Once created, this lockfile is not removed from the filesystem.
-	LockFile string `json:"lockFile,omitempty"`
-	//Enter the edition IDs of the databases you would like to update.
-	//Should be  GeoLite2-City
-	EditionID string `json:"editionID,omitempty"`
-	//update url to use. Defaults to https://updates.maxmind.com
-	UpdateUrl string `json:"updateUrl,omitempty"`
-	// The Frequency in seconds to run update. Default to 0, only update On Start
-	UpdateFrequency int       `json:"updateFrequency,omitempty"`
-	done            chan bool `json:"-"`
+	
+	// mutex protects concurrent access to DBHandler
+	mutex *sync.RWMutex `json:"-"`
+	
+	// DatabasePath is the filesystem path to the GeoIP2 database file
+	// Example: "/etc/geoip/GeoLite2-City.mmdb"
+	DatabasePath string `json:"database_path,omitempty"`
+	
+	// ReloadInterval specifies how often to reload the database (in hours)
+	// 0 = no automatic reloading, manual reload via caddy admin API only
+	ReloadInterval int `json:"reload_interval,omitempty"`
+	
+	// done channel signals the reload timer goroutine to stop
+	done chan bool `json:"-"`
 }
 
+// Module name for Caddy's app registry
 const (
 	moduleName = "geoip2"
 )
 
+// Default configuration values
+const (
+	DefaultDatabasePath = "/etc/geoip/GeoLite2-City.mmdb"
+	DefaultReloadHours  = 24 // Daily reload by default
+)
+
+// Module registration - called when Caddy starts
 func init() {
 	caddy.RegisterModule(GeoIP2State{})
 	httpcaddyfile.RegisterGlobalOption("geoip2", parseGeoip2)
 }
 
+// CaddyModule returns module information for Caddy's module system
 func (GeoIP2State) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "geoip2",
@@ -60,6 +69,8 @@ func (GeoIP2State) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// parseGeoip2 handles the global "geoip2" directive in Caddyfile
+// This creates the app configuration that will be shared across all sites
 func parseGeoip2(d *caddyfile.Dispenser, _ any) (any, error) {
 	state := GeoIP2State{}
 	err := state.UnmarshalCaddyfile(d)
@@ -68,227 +79,350 @@ func parseGeoip2(d *caddyfile.Dispenser, _ any) (any, error) {
 		Value: caddyconfig.JSON(state, nil),
 	}, err
 }
+
+// Start initializes the GeoIP2 app when Caddy starts
+// This method is called once when the server starts up
 func (g *GeoIP2State) Start() error {
+	// Initialize mutex if not already done
 	if g.mutex == nil {
-		g.mutex = &sync.Mutex{}
+		g.mutex = &sync.RWMutex{}
 	}
-	caddy.Log().Named("geoip2").Info(fmt.Sprintf("Start"))
-	if g.DatabaseDirectory != "" && g.EditionID != "" {
-		go g.runGeoIP2Update()
+	
+	caddy.Log().Named("geoip2").Info("starting GeoIP2 module",
+		zap.String("database_path", g.DatabasePath),
+		zap.String("reload_interval", fmt.Sprintf("%dh", g.ReloadInterval)))
+	
+	// Load database for the first time
+	if err := g.loadDatabase(); err != nil {
+		return fmt.Errorf("failed to load initial database: %v", err)
 	}
-	if g.UpdateFrequency > 0 && g.AccountID > 0 && g.LicenseKey != "" {
-		g.runGeoIP2UpdateLoop()
+	
+	// Start automatic reload timer if configured
+	if g.ReloadInterval > 0 {
+		g.startReloadTimer()
 	}
+	
 	return nil
 }
+
+// Stop cleanly shuts down the GeoIP2 app when Caddy stops
+// This method is called when the server is shutting down
 func (g *GeoIP2State) Stop() error {
+	// Stop the reload timer if running
 	if g.done != nil {
-		g.done <- true
-		caddy.Log().Named("geoip2").Debug(fmt.Sprintf("Send true to done chan"))
+		close(g.done)
+		caddy.Log().Named("geoip2").Debug("stopped reload timer")
 	}
+	
+	// Close database connection
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+	
 	if g.DBHandler != nil {
-		g.DBHandler.Close()
-		caddy.Log().Named("geoip2").Debug(fmt.Sprintf("Close DBHandler"))
+		if err := g.DBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing database", 
+				zap.Error(err))
+		}
+		g.DBHandler = nil
+		caddy.Log().Named("geoip2").Debug("closed database")
 	}
-	caddy.Log().Named("geoip2").Info(fmt.Sprintf("Stop"))
-
+	
+	caddy.Log().Named("geoip2").Info("stopped GeoIP2 module")
 	return nil
 }
 
-// for global
+// UnmarshalCaddyfile parses the Caddyfile configuration for this app
+// Expected format:
+//   geoip2 {
+//     database_path /path/to/database.mmdb
+//     reload_interval daily
+//   }
 func (g *GeoIP2State) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// Initialize mutex early for thread safety
 	if g.mutex == nil {
-		g.mutex = &sync.Mutex{}
+		g.mutex = &sync.RWMutex{}
 	}
-	g.mutex.Lock()
-	defer g.mutex.Unlock()
-
+	
 	for d.Next() {
-		var value string
-		key := d.Val()
-		if !d.Args(&value) {
-			continue
-		}
-		switch key {
-		case "accountId":
-			AccountID, err := strconv.Atoi(value)
-			if err == nil {
-				g.AccountID = AccountID
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "database_path":
+				if !d.Args(&g.DatabasePath) {
+					return d.ArgErr()
+				}
+				// Expand environment variables and resolve relative paths
+				g.DatabasePath = os.ExpandEnv(g.DatabasePath)
+				if !filepath.IsAbs(g.DatabasePath) {
+					g.DatabasePath, _ = filepath.Abs(g.DatabasePath)
+				}
+				
+			case "reload_interval":
+				var intervalStr string
+				if !d.Args(&intervalStr) {
+					return d.ArgErr()
+				}
+				
+				// Parse reload interval with flexible formats
+				interval, err := g.parseReloadInterval(intervalStr)
+				if err != nil {
+					return d.Errf("invalid reload_interval '%s': %v", intervalStr, err)
+				}
+				g.ReloadInterval = interval
+				
+			default:
+				return d.Errf("unknown directive: %s", d.Val())
 			}
-			break
-		case "databaseDirectory":
-			g.DatabaseDirectory = value
-			break
-		case "licenseKey":
-			g.LicenseKey = value
-			break
-		case "lockFile":
-			g.LockFile = value
-			break
-		case "editionID":
-			g.EditionID = value
-			break
-		case "updateUrl":
-			g.UpdateUrl = value
-			break
-		case "updateFrequency":
-			UpdateFrequency, err := strconv.Atoi(value)
-			if err == nil {
-				g.UpdateFrequency = UpdateFrequency
-			}
-			break
 		}
 	}
-	caddy.Log().Named("geoip2").Info(fmt.Sprintf("setup Config %v", g))
-
-	if g.UpdateUrl == "" {
-		g.UpdateUrl = "https://updates.maxmind.com"
-	}
-
-	if g.DatabaseDirectory == "" {
-		g.DatabaseDirectory = "/tmp/"
-	}
-	if g.LockFile == "" {
-		g.LockFile = "/tmp/geoip2.lock"
-	}
-
-	if g.EditionID == "" {
-		g.EditionID = "GeoLite2-City"
-	}
-
+	
+	// Set defaults if not specified
+	g.setDefaults()
+	
+	caddy.Log().Named("geoip2").Info("configured GeoIP2 app",
+		zap.String("database_path", g.DatabasePath),
+		zap.String("reload_interval", fmt.Sprintf("%dh", g.ReloadInterval)))
+	
 	return nil
 }
 
-func (g *GeoIP2State) runGeoIP2Update() {
-	if g.mutex == nil {
-		g.mutex = &sync.Mutex{}
-	}
-	g.mutex.Lock()
-	defer g.mutex.Unlock()
-	config := geoipupdate.Config{
-		AccountID:         g.AccountID,
-		DatabaseDirectory: g.DatabaseDirectory,
-		LicenseKey:        g.LicenseKey,
-		LockFile:          g.LockFile,
-		EditionIDs:        []string{g.EditionID},
-		URL:               g.UpdateUrl,
-	}
-	if g.DatabaseDirectory == "" || g.EditionID == "" {
-		caddy.Log().Named("geoip2").Error(fmt.Sprintf("database is not loaded DatabaseDirectory %s   EditionID %s", g.DatabaseDirectory, g.EditionID))
-		return
-	}
-	caddy.Log().Named("geoip2").Info(fmt.Sprintf("geoipupdate.Config %v", config))
-	client := geoipupdate.NewClient(&config)
-	dbReader := database.NewHTTPDatabaseReader(client, &config)
-	editionID := config.EditionIDs[0]
-	// for _, editionID := range config.EditionIDs {
-	filename, err := geoipupdate.GetFilename(&config, editionID, client)
-
-	caddy.Log().Named("geoip2").Info(fmt.Sprintf("retrieving filename for %s", editionID))
-	if err != nil {
-		caddy.Log().Named("geoip2").Error(fmt.Sprintf("error retrieving filename for %s: %v", editionID, err))
-	}
-	filePath := filepath.Join(config.DatabaseDirectory, filename)
-	if g.DBHandler == nil {
-		g.DBHandler, _ = maxminddb.Open(filePath)
-	}
-	if config.AccountID <= 0 || config.LicenseKey == "" || g.UpdateFrequency <= 0 {
-		caddy.Log().Named("geoip2").Info(fmt.Sprintf("auto update is not enabled AccountID %d LicenseKey %s UpdateFrequency %d", config.AccountID, config.LicenseKey, g.UpdateFrequency))
-		return
-	}
-	newFilePath := filePath + ".new"
-	dbWriter, err := database.NewLocalFileDatabaseWriter(newFilePath, config.LockFile, config.Verbose)
-	if err != nil {
-		caddy.Log().Named("geoip2").Error(fmt.Sprintf("error creating database writer for %s: %v", editionID, err))
-	}
-	if err := dbReader.Get(dbWriter, editionID); err != nil {
-		caddy.Log().Named("geoip2").Error(fmt.Sprintf("error creating database writer for %s: %v", editionID, err))
-	}
-	caddy.Log().Named("geoip2").Info(fmt.Sprintf("filename for %s done", editionID))
-	if _, err := os.Stat(newFilePath); errors.Is(err, fs.ErrNotExist) {
-		caddy.Log().Named("geoip2").Error(fmt.Sprintf("downloadfile Error %v", err))
-	} else {
-
-		caddy.Log().Named("geoip2").Debug(fmt.Sprintf("downloadfile Error %v", err))
-		e := os.Rename(newFilePath, filePath)
-		caddy.Log().Named("geoip2").Debug(fmt.Sprintf("rename  %s %s %v", newFilePath, filePath, e))
-		if e != nil {
-			caddy.Log().Named("geoip2").Error(fmt.Sprintf("rename file  Error %v", err))
-			return
+// parseReloadInterval converts various interval formats to hours
+// Supported formats: "daily", "24h", "1d", "2", "48"
+func (g *GeoIP2State) parseReloadInterval(intervalStr string) (int, error) {
+	switch intervalStr {
+	case "daily", "1d", "24h":
+		return 24, nil
+	case "weekly", "7d", "168h":
+		return 168, nil
+	case "off", "disable", "0":
+		return 0, nil
+	default:
+		// Try to parse as number of hours
+		if hours, err := strconv.Atoi(intervalStr); err == nil {
+			if hours < 0 {
+				return 0, fmt.Errorf("reload interval cannot be negative")
+			}
+			return hours, nil
 		}
-
-		newInstance, openerr := maxminddb.Open(filePath)
-		if openerr != nil {
-			caddy.Log().Named("geoip2").Error(fmt.Sprintf("open file  Error %s", filePath))
-		}
-		oldInstance := g.DBHandler
-		g.DBHandler = newInstance
-		if oldInstance != nil {
-			oldInstance.Close()
-		}
+		return 0, fmt.Errorf("invalid format, use 'daily', 'weekly', 'off', or number of hours")
 	}
 }
 
-func (g *GeoIP2State) runGeoIP2UpdateLoop() {
+// setDefaults applies default values for unspecified configuration
+func (g *GeoIP2State) setDefaults() {
+	if g.DatabasePath == "" {
+		g.DatabasePath = DefaultDatabasePath
+	}
+	// Note: ReloadInterval of 0 (no auto-reload) is a valid default
+}
+
+// loadDatabase loads or reloads the GeoIP2 database from disk
+// This method is thread-safe and can be called concurrently
+func (g *GeoIP2State) loadDatabase() error {
+	// Validate database file exists and is readable
+	if err := g.validateDatabaseFile(); err != nil {
+		return err
+	}
+	
+	// Acquire exclusive lock for database replacement
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+	
+	// Open new database instance
+	newDB, err := maxminddb.Open(g.DatabasePath)
+	if err != nil {
+		return fmt.Errorf("failed to open database %s: %v", g.DatabasePath, err)
+	}
+	
+	// Close old database if present
+	if g.DBHandler != nil {
+		if err := g.DBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing old database", 
+				zap.Error(err))
+		}
+	}
+	
+	// Replace with new database
+	g.DBHandler = newDB
+	
+	// Log successful load with database metadata
+	metadata := newDB.Metadata
+	caddy.Log().Named("geoip2").Info("database loaded successfully",
+		zap.String("path", g.DatabasePath),
+		zap.Uint64("build_epoch", uint64(metadata.BuildEpoch)),
+		zap.String("database_type", metadata.DatabaseType))
+	
+	return nil
+}
+
+// validateDatabaseFile checks if the database file exists and is accessible
+func (g *GeoIP2State) validateDatabaseFile() error {
+	// Check if file exists
+	info, err := os.Stat(g.DatabasePath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("database file not found: %s", g.DatabasePath)
+		}
+		return fmt.Errorf("cannot access database file %s: %v", g.DatabasePath, err)
+	}
+	
+	// Check if it's a regular file (not directory, symlink, etc.)
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("database path is not a regular file: %s", g.DatabasePath)
+	}
+	
+	// Check minimum file size (MaxMind databases are at least a few MB)
+	if info.Size() < 1024*1024 { // Less than 1MB is suspicious
+		return fmt.Errorf("database file appears too small: %d bytes", info.Size())
+	}
+	
+	return nil
+}
+
+// startReloadTimer starts a background goroutine that periodically reloads the database
+func (g *GeoIP2State) startReloadTimer() {
 	g.done = make(chan bool, 1)
-	go func(t time.Duration) {
-		tick := time.NewTicker(t).C
+	
+	go func() {
+		interval := time.Duration(g.ReloadInterval) * time.Hour
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		
+		caddy.Log().Named("geoip2").Info("started database reload timer",
+			zap.Duration("interval", interval),
+			zap.String("next_reload", time.Now().Add(interval).Format(time.RFC3339)))
+		
 		for {
 			select {
-			// t has passed, so id can be destroyed
-			case <-tick:
-
-				caddy.Log().Named("geoip2").Info(fmt.Sprintf("update tick %v", g))
-				g.runGeoIP2Update()
-				// We are finished destroying stuff
+			case <-ticker.C:
+				g.performScheduledReload()
+				
 			case <-g.done:
-				caddy.Log().Named("geoip2").Info(fmt.Sprintf("destroying"))
+				caddy.Log().Named("geoip2").Debug("reload timer stopped")
 				return
 			}
 		}
-	}(time.Second * time.Duration(g.UpdateFrequency))
+	}()
 }
 
-func (g *GeoIP2State) Destruct() error {
-	if g.mutex == nil {
-		g.mutex = &sync.Mutex{}
+// performScheduledReload handles the actual database reload with error handling
+func (g *GeoIP2State) performScheduledReload() {
+	caddy.Log().Named("geoip2").Info("performing scheduled database reload")
+	
+	startTime := time.Now()
+	if err := g.loadDatabase(); err != nil {
+		caddy.Log().Named("geoip2").Error("scheduled database reload failed", 
+			zap.Error(err),
+			zap.Duration("duration", time.Since(startTime)))
+	} else {
+		caddy.Log().Named("geoip2").Info("scheduled database reload completed",
+			zap.Duration("duration", time.Since(startTime)),
+			zap.String("next_reload", time.Now().Add(time.Duration(g.ReloadInterval)*time.Hour).Format(time.RFC3339)))
 	}
-	g.mutex.Lock()
-	defer g.mutex.Unlock()
-
-	// stop all background tasks
-	if g.done != nil {
-		close(g.done)
-	}
-
-	if g.DBHandler != nil {
-		return g.DBHandler.Close()
-	}
-
-	return nil
 }
 
-func (g *GeoIP2State) Provision(ctx caddy.Context) error {
-	caddy.Log().Named("geoip2").Info(fmt.Sprintf("Provision"))
-	return nil
-}
-func (g GeoIP2State) Validate() error {
-	caddy.Log().Named("geoip2").Info(fmt.Sprintf("Validate"))
-
-	if g.DatabaseDirectory == "" || g.EditionID == "" {
-		return fmt.Errorf("DatabaseDirectory %s EditionID %s is not avalidate", g.DatabaseDirectory, g.EditionID)
+// Lookup performs a thread-safe GeoIP lookup
+// This is the main API used by the HTTP handlers
+func (g *GeoIP2State) Lookup(ip interface{}, result interface{}) error {
+	// Acquire read lock for database access
+	g.mutex.RLock()
+	defer g.mutex.RUnlock()
+	
+	// Check if database is available
+	if g.DBHandler == nil {
+		return errors.New("GeoIP2 database not loaded")
 	}
-
-	if g.AccountID <= 0 || g.LicenseKey == "" || g.UpdateFrequency <= 0 {
-		filePath := filepath.Join(g.DatabaseDirectory, g.EditionID+".mmdb")
-		if _, err := os.Stat(filePath); errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("DatabaseDirectory %s EditionID %s file not found", g.DatabaseDirectory, g.EditionID)
+	
+	// Convert interface{} to net.IP if needed
+	var netIP net.IP
+	switch v := ip.(type) {
+	case net.IP:
+		netIP = v
+	case string:
+		netIP = net.ParseIP(v)
+		if netIP == nil {
+			return fmt.Errorf("invalid IP address: %s", v)
 		}
+	default:
+		return fmt.Errorf("unsupported IP type: %T", ip)
 	}
-	return nil
-
+	
+	// Perform the actual lookup
+	return g.DBHandler.Lookup(netIP, result)
 }
 
+// GetDatabaseInfo returns information about the currently loaded database
+// Useful for monitoring and debugging
+func (g *GeoIP2State) GetDatabaseInfo() map[string]interface{} {
+	g.mutex.RLock()
+	defer g.mutex.RUnlock()
+	
+	info := map[string]interface{}{
+		"database_path":    g.DatabasePath,
+		"reload_interval":  g.ReloadInterval,
+		"database_loaded":  g.DBHandler != nil,
+	}
+	
+	if g.DBHandler != nil {
+		metadata := g.DBHandler.Metadata
+		info["build_epoch"] = metadata.BuildEpoch
+		info["database_type"] = metadata.DatabaseType
+		info["ip_version"] = metadata.IPVersion
+		info["record_size"] = metadata.RecordSize
+		info["node_count"] = metadata.NodeCount
+	}
+	
+	return info
+}
+
+// Provision is called by Caddy to set up the module
+func (g *GeoIP2State) Provision(ctx caddy.Context) error {
+	caddy.Log().Named("geoip2").Debug("provisioning GeoIP2 app")
+	return nil
+}
+
+// Validate checks if the app configuration is valid
+// This is called before Start() to catch configuration errors early
+func (g GeoIP2State) Validate() error {
+	// Validate required configuration
+	if g.DatabasePath == "" {
+		return fmt.Errorf("database_path is required")
+	}
+	
+	// Validate reload interval
+	if g.ReloadInterval < 0 {
+		return fmt.Errorf("reload_interval cannot be negative")
+	}
+	
+	// Validate database file
+	if err := g.validateDatabaseFile(); err != nil {
+		return fmt.Errorf("database validation failed: %v", err)
+	}
+	
+	// Test database can be opened
+	db, err := maxminddb.Open(g.DatabasePath)
+	if err != nil {
+		return fmt.Errorf("cannot open database %s: %v", g.DatabasePath, err)
+	}
+	defer db.Close()
+	
+	// Validate database type (should be City or Country database)
+	metadata := db.Metadata
+	if metadata.DatabaseType != "GeoLite2-City" && 
+	   metadata.DatabaseType != "GeoIP2-City" && 
+	   metadata.DatabaseType != "GeoLite2-Country" && 
+	   metadata.DatabaseType != "GeoIP2-Country" {
+		caddy.Log().Named("geoip2").Warn("unknown database type", 
+			zap.String("type", metadata.DatabaseType))
+	}
+	
+	caddy.Log().Named("geoip2").Info("validation successful",
+		zap.String("database_type", metadata.DatabaseType),
+		zap.Uint64("build_epoch", uint64(metadata.BuildEpoch)))
+	
+	return nil
+}
+
+// Interface guards - compile-time checks that we implement required interfaces
 var (
 	_ caddyfile.Unmarshaler = (*GeoIP2State)(nil)
 	_ caddy.Module          = (*GeoIP2State)(nil)
