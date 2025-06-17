@@ -24,32 +24,49 @@ import (
 // - Thread-safe database access
 // - Automatic database reloading
 // - Shared state across multiple handler instances
-// - Support for dual databases (City + ASN) for complete data coverage
+// - Support for multiple specialized databases with intelligent routing
+// - Performance optimization: EU IPs use Europe-specific database, others use global database
 type GeoIP2State struct {
-	// DBHandler is the MaxMind database reader instance for main database (City/Country)
-	// Protected by mutex for thread-safe access
-	DBHandler *maxminddb.Reader `json:"-"`
-	
+	// CountryDBHandler is the MaxMind Country database reader instance
+	// Used for country code and EU status lookups
+	CountryDBHandler *maxminddb.Reader `json:"-"`
+
+	// CityDBHandler is the MaxMind City database reader instance (Europe-focused)
+	// Used for city names, subdivisions, and geographic coordinates for European IPs
+	CityDBHandler *maxminddb.Reader `json:"-"`
+
+	// GlobalCityDBHandler is the global MaxMind City database reader instance
+	// Used for city data for non-European IPs as fallback
+	GlobalCityDBHandler *maxminddb.Reader `json:"-"`
+
 	// ASNDBHandler is the MaxMind ASN database reader instance
-	// Used to supplement City database with ASN data when needed
+	// Used for ASN number and organization lookups
 	ASNDBHandler *maxminddb.Reader `json:"-"`
-	
-	// mutex protects concurrent access to both DBHandler and ASNDBHandler
+
+	// mutex protects concurrent access to all database handlers
 	mutex *sync.RWMutex `json:"-"`
-	
-	// DatabasePath is the filesystem path to the main GeoIP2 database file
-	// Example: "/etc/geoip/GeoLite2-City.mmdb"
-	DatabasePath string `json:"database_path,omitempty"`
-	
+
+	// CountryDatabasePath is the filesystem path to the Country database file
+	// Example: "/etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-Country.mmdb"
+	CountryDatabasePath string `json:"country_database_path,omitempty"`
+
+	// CityDatabasePath is the filesystem path to the Europe-focused City database file
+	// Example: "/etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-City-Europe.mmdb"
+	CityDatabasePath string `json:"city_database_path,omitempty"`
+
+	// GlobalCityDatabasePath is the filesystem path to the global City database file
+	// Example: "/etc/nginx/maxmind-geo-ip/GeoLite2-City.mmdb"
+	// Used as fallback for non-European IPs
+	GlobalCityDatabasePath string `json:"global_city_database_path,omitempty"`
+
 	// ASNDatabasePath is the filesystem path to the ASN database file
-	// Example: "/etc/geoip/GeoLite2-ASN.mmdb"
-	// Optional: if not specified, ASN data will be empty
+	// Example: "/etc/nginx/maxmind-geo-ip/GeoLite2-ASN.mmdb"
 	ASNDatabasePath string `json:"asn_database_path,omitempty"`
-	
-	// ReloadInterval specifies how often to reload the database (in hours)
+
+	// ReloadInterval specifies how often to reload the databases (in hours)
 	// 0 = no automatic reloading, manual reload via caddy admin API only
 	ReloadInterval int `json:"reload_interval,omitempty"`
-	
+
 	// done channel signals the reload timer goroutine to stop
 	done chan bool `json:"-"`
 }
@@ -61,8 +78,7 @@ const (
 
 // Default configuration values
 const (
-	DefaultDatabasePath = "/etc/geoip/GeoLite2-City.mmdb"
-	DefaultReloadHours  = 24 // Daily reload by default
+	DefaultReloadHours = 24 // Daily reload by default
 )
 
 // Module registration - called when Caddy starts
@@ -97,21 +113,24 @@ func (g *GeoIP2State) Start() error {
 	if g.mutex == nil {
 		g.mutex = &sync.RWMutex{}
 	}
-	
+
 	caddy.Log().Named("geoip2").Info("starting GeoIP2 module",
-		zap.String("database_path", g.DatabasePath),
+		zap.String("country_database_path", g.CountryDatabasePath),
+		zap.String("city_database_path", g.CityDatabasePath),
+		zap.String("global_city_database_path", g.GlobalCityDatabasePath),
+		zap.String("asn_database_path", g.ASNDatabasePath),
 		zap.String("reload_interval", fmt.Sprintf("%dh", g.ReloadInterval)))
-	
+
 	// Load database for the first time
 	if err := g.loadDatabase(); err != nil {
 		return fmt.Errorf("failed to load initial database: %v", err)
 	}
-	
+
 	// Start automatic reload timer if configured
 	if g.ReloadInterval > 0 {
 		g.startReloadTimer()
 	}
-	
+
 	return nil
 }
 
@@ -123,50 +142,97 @@ func (g *GeoIP2State) Stop() error {
 		close(g.done)
 		caddy.Log().Named("geoip2").Debug("stopped reload timer")
 	}
-	
+
 	// Close database connection
 	g.mutex.Lock()
 	defer g.mutex.Unlock()
-	
-	if g.DBHandler != nil {
-		if err := g.DBHandler.Close(); err != nil {
-			caddy.Log().Named("geoip2").Warn("error closing database", 
+
+	if g.CountryDBHandler != nil {
+		if err := g.CountryDBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing country database",
 				zap.Error(err))
 		}
-		g.DBHandler = nil
-		caddy.Log().Named("geoip2").Debug("closed database")
+		g.CountryDBHandler = nil
+		caddy.Log().Named("geoip2").Debug("closed country database")
 	}
-	
+	if g.CityDBHandler != nil {
+		if err := g.CityDBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing city database",
+				zap.Error(err))
+		}
+		g.CityDBHandler = nil
+		caddy.Log().Named("geoip2").Debug("closed city database")
+	}
+	if g.GlobalCityDBHandler != nil {
+		if err := g.GlobalCityDBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing global city database",
+				zap.Error(err))
+		}
+		g.GlobalCityDBHandler = nil
+		caddy.Log().Named("geoip2").Debug("closed global city database")
+	}
+	if g.ASNDBHandler != nil {
+		if err := g.ASNDBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing ASN database",
+				zap.Error(err))
+		}
+		g.ASNDBHandler = nil
+		caddy.Log().Named("geoip2").Debug("closed ASN database")
+	}
+
 	caddy.Log().Named("geoip2").Info("stopped GeoIP2 module")
 	return nil
 }
 
 // UnmarshalCaddyfile parses the Caddyfile configuration for this app
 // Expected format:
-//   geoip2 {
-//     database_path /path/to/database.mmdb
-//     asn_database_path /path/to/asn.mmdb  # optional
-//     reload_interval daily
-//   }
+//
+//	geoip2 {
+//	  country_database_path /path/to/country.mmdb
+//	  city_database_path /path/to/city-europe.mmdb
+//	  global_city_database_path /path/to/city-global.mmdb
+//	  asn_database_path /path/to/asn.mmdb  # optional
+//	  reload_interval daily
+//	}
 func (g *GeoIP2State) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// Initialize mutex early for thread safety
 	if g.mutex == nil {
 		g.mutex = &sync.RWMutex{}
 	}
-	
+
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
-			case "database_path":
-				if !d.Args(&g.DatabasePath) {
+			case "country_database_path":
+				if !d.Args(&g.CountryDatabasePath) {
 					return d.ArgErr()
 				}
 				// Expand environment variables and resolve relative paths
-				g.DatabasePath = os.ExpandEnv(g.DatabasePath)
-				if !filepath.IsAbs(g.DatabasePath) {
-					g.DatabasePath, _ = filepath.Abs(g.DatabasePath)
+				g.CountryDatabasePath = os.ExpandEnv(g.CountryDatabasePath)
+				if !filepath.IsAbs(g.CountryDatabasePath) {
+					g.CountryDatabasePath, _ = filepath.Abs(g.CountryDatabasePath)
 				}
-				
+
+			case "city_database_path":
+				if !d.Args(&g.CityDatabasePath) {
+					return d.ArgErr()
+				}
+				// Expand environment variables and resolve relative paths
+				g.CityDatabasePath = os.ExpandEnv(g.CityDatabasePath)
+				if !filepath.IsAbs(g.CityDatabasePath) {
+					g.CityDatabasePath, _ = filepath.Abs(g.CityDatabasePath)
+				}
+
+			case "global_city_database_path":
+				if !d.Args(&g.GlobalCityDatabasePath) {
+					return d.ArgErr()
+				}
+				// Expand environment variables and resolve relative paths
+				g.GlobalCityDatabasePath = os.ExpandEnv(g.GlobalCityDatabasePath)
+				if !filepath.IsAbs(g.GlobalCityDatabasePath) {
+					g.GlobalCityDatabasePath, _ = filepath.Abs(g.GlobalCityDatabasePath)
+				}
+
 			case "asn_database_path":
 				if !d.Args(&g.ASNDatabasePath) {
 					return d.ArgErr()
@@ -176,34 +242,36 @@ func (g *GeoIP2State) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !filepath.IsAbs(g.ASNDatabasePath) {
 					g.ASNDatabasePath, _ = filepath.Abs(g.ASNDatabasePath)
 				}
-				
+
 			case "reload_interval":
 				var intervalStr string
 				if !d.Args(&intervalStr) {
 					return d.ArgErr()
 				}
-				
+
 				// Parse reload interval with flexible formats
 				interval, err := g.parseReloadInterval(intervalStr)
 				if err != nil {
 					return d.Errf("invalid reload_interval '%s': %v", intervalStr, err)
 				}
 				g.ReloadInterval = interval
-				
+
 			default:
 				return d.Errf("unknown directive: %s", d.Val())
 			}
 		}
 	}
-	
+
 	// Set defaults if not specified
 	g.setDefaults()
-	
+
 	caddy.Log().Named("geoip2").Info("configured GeoIP2 app",
-		zap.String("database_path", g.DatabasePath),
+		zap.String("country_database_path", g.CountryDatabasePath),
+		zap.String("city_database_path", g.CityDatabasePath),
+		zap.String("global_city_database_path", g.GlobalCityDatabasePath),
 		zap.String("asn_database_path", g.ASNDatabasePath),
 		zap.String("reload_interval", fmt.Sprintf("%dh", g.ReloadInterval)))
-	
+
 	return nil
 }
 
@@ -231,21 +299,39 @@ func (g *GeoIP2State) parseReloadInterval(intervalStr string) (int, error) {
 
 // setDefaults applies default values for unspecified configuration
 func (g *GeoIP2State) setDefaults() {
-	if g.DatabasePath == "" {
-		g.DatabasePath = DefaultDatabasePath
+	if g.CountryDatabasePath == "" {
+		g.CountryDatabasePath = "/etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-Country.mmdb"
+	}
+	if g.CityDatabasePath == "" {
+		g.CityDatabasePath = "/etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-City-Europe.mmdb"
+	}
+	if g.GlobalCityDatabasePath == "" {
+		g.GlobalCityDatabasePath = "/etc/nginx/maxmind-geo-ip/GeoLite2-City.mmdb"
 	}
 	// Note: ReloadInterval of 0 (no auto-reload) is a valid default
 }
 
 // loadDatabase loads or reloads the GeoIP2 database from disk
 // This method is thread-safe and can be called concurrently
-// Supports loading both main database and optional ASN database
+// Supports loading all three databases
 func (g *GeoIP2State) loadDatabase() error {
-	// Validate main database file exists and is readable
-	if err := g.validateDatabaseFile(g.DatabasePath); err != nil {
-		return fmt.Errorf("main database validation failed: %v", err)
+	// Validate country database file exists and is readable
+	if err := g.validateDatabaseFile(g.CountryDatabasePath); err != nil {
+		return fmt.Errorf("country database validation failed: %v", err)
 	}
-	
+
+	// Validate city database file exists and is readable
+	if err := g.validateDatabaseFile(g.CityDatabasePath); err != nil {
+		return fmt.Errorf("city database validation failed: %v", err)
+	}
+
+	// Validate global city database file exists and is readable
+	if err := g.validateDatabaseFile(g.GlobalCityDatabasePath); err != nil {
+		caddy.Log().Named("geoip2").Warn("global city database validation failed, global city data will be empty",
+			zap.String("global_city_path", g.GlobalCityDatabasePath),
+			zap.Error(err))
+	}
+
 	// Validate ASN database if specified
 	var asnDBValid bool
 	if g.ASNDatabasePath != "" {
@@ -257,17 +343,32 @@ func (g *GeoIP2State) loadDatabase() error {
 			asnDBValid = true
 		}
 	}
-	
+
 	// Acquire exclusive lock for database replacement
 	g.mutex.Lock()
 	defer g.mutex.Unlock()
-	
-	// Open new main database instance
-	newDB, err := maxminddb.Open(g.DatabasePath)
+
+	// Open new country database instance
+	newCountryDB, err := maxminddb.Open(g.CountryDatabasePath)
 	if err != nil {
-		return fmt.Errorf("failed to open main database %s: %v", g.DatabasePath, err)
+		return fmt.Errorf("failed to open country database %s: %v", g.CountryDatabasePath, err)
 	}
-	
+
+	// Open new city database instance
+	newCityDB, err := maxminddb.Open(g.CityDatabasePath)
+	if err != nil {
+		return fmt.Errorf("failed to open city database %s: %v", g.CityDatabasePath, err)
+	}
+
+	// Open global city database instance
+	newGlobalCityDB, err := maxminddb.Open(g.GlobalCityDatabasePath)
+	if err != nil {
+		caddy.Log().Named("geoip2").Warn("failed to open global city database, global city data will be empty",
+			zap.String("global_city_path", g.GlobalCityDatabasePath),
+			zap.Error(err))
+		newGlobalCityDB = nil
+	}
+
 	// Open ASN database if valid
 	var newASNDB *maxminddb.Reader
 	if asnDBValid {
@@ -279,32 +380,60 @@ func (g *GeoIP2State) loadDatabase() error {
 			newASNDB = nil
 		}
 	}
-	
+
 	// Close old databases if present
-	if g.DBHandler != nil {
-		if err := g.DBHandler.Close(); err != nil {
-			caddy.Log().Named("geoip2").Warn("error closing old main database", 
+	if g.CountryDBHandler != nil {
+		if err := g.CountryDBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing old country database",
+				zap.Error(err))
+		}
+	}
+	if g.CityDBHandler != nil {
+		if err := g.CityDBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing old city database",
+				zap.Error(err))
+		}
+	}
+	if g.GlobalCityDBHandler != nil {
+		if err := g.GlobalCityDBHandler.Close(); err != nil {
+			caddy.Log().Named("geoip2").Warn("error closing old global city database",
 				zap.Error(err))
 		}
 	}
 	if g.ASNDBHandler != nil {
 		if err := g.ASNDBHandler.Close(); err != nil {
-			caddy.Log().Named("geoip2").Warn("error closing old ASN database", 
+			caddy.Log().Named("geoip2").Warn("error closing old ASN database",
 				zap.Error(err))
 		}
 	}
-	
+
 	// Replace with new databases
-	g.DBHandler = newDB
+	g.CountryDBHandler = newCountryDB
+	g.CityDBHandler = newCityDB
+	g.GlobalCityDBHandler = newGlobalCityDB
 	g.ASNDBHandler = newASNDB
-	
+
 	// Log successful load with database metadata
-	metadata := newDB.Metadata
-	caddy.Log().Named("geoip2").Info("main database loaded successfully",
-		zap.String("path", g.DatabasePath),
-		zap.Uint64("build_epoch", uint64(metadata.BuildEpoch)),
-		zap.String("database_type", metadata.DatabaseType))
-	
+	countryMetadata := newCountryDB.Metadata
+	caddy.Log().Named("geoip2").Info("country database loaded successfully",
+		zap.String("path", g.CountryDatabasePath),
+		zap.Uint64("build_epoch", uint64(countryMetadata.BuildEpoch)),
+		zap.String("database_type", countryMetadata.DatabaseType))
+
+	cityMetadata := newCityDB.Metadata
+	caddy.Log().Named("geoip2").Info("city database loaded successfully",
+		zap.String("path", g.CityDatabasePath),
+		zap.Uint64("build_epoch", uint64(cityMetadata.BuildEpoch)),
+		zap.String("database_type", cityMetadata.DatabaseType))
+
+	if newGlobalCityDB != nil {
+		globalCityMetadata := newGlobalCityDB.Metadata
+		caddy.Log().Named("geoip2").Info("global city database loaded successfully",
+			zap.String("path", g.GlobalCityDatabasePath),
+			zap.Uint64("build_epoch", uint64(globalCityMetadata.BuildEpoch)),
+			zap.String("database_type", globalCityMetadata.DatabaseType))
+	}
+
 	if newASNDB != nil {
 		asnMetadata := newASNDB.Metadata
 		caddy.Log().Named("geoip2").Info("ASN database loaded successfully",
@@ -312,7 +441,7 @@ func (g *GeoIP2State) loadDatabase() error {
 			zap.Uint64("build_epoch", uint64(asnMetadata.BuildEpoch)),
 			zap.String("database_type", asnMetadata.DatabaseType))
 	}
-	
+
 	return nil
 }
 
@@ -326,38 +455,38 @@ func (g *GeoIP2State) validateDatabaseFile(path string) error {
 		}
 		return fmt.Errorf("cannot access database file %s: %v", path, err)
 	}
-	
+
 	// Check if it's a regular file (not directory, symlink, etc.)
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("database path is not a regular file: %s", path)
 	}
-	
+
 	// Check minimum file size (MaxMind databases are at least a few MB)
 	if info.Size() < 1024*1024 { // Less than 1MB is suspicious
 		return fmt.Errorf("database file appears too small: %d bytes", info.Size())
 	}
-	
+
 	return nil
 }
 
 // startReloadTimer starts a background goroutine that periodically reloads the database
 func (g *GeoIP2State) startReloadTimer() {
 	g.done = make(chan bool, 1)
-	
+
 	go func() {
 		interval := time.Duration(g.ReloadInterval) * time.Hour
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		
+
 		caddy.Log().Named("geoip2").Info("started database reload timer",
 			zap.Duration("interval", interval),
 			zap.String("next_reload", time.Now().Add(interval).Format(time.RFC3339)))
-		
+
 		for {
 			select {
 			case <-ticker.C:
 				g.performScheduledReload()
-				
+
 			case <-g.done:
 				caddy.Log().Named("geoip2").Debug("reload timer stopped")
 				return
@@ -369,10 +498,10 @@ func (g *GeoIP2State) startReloadTimer() {
 // performScheduledReload handles the actual database reload with error handling
 func (g *GeoIP2State) performScheduledReload() {
 	caddy.Log().Named("geoip2").Info("performing scheduled database reload")
-	
+
 	startTime := time.Now()
 	if err := g.loadDatabase(); err != nil {
-		caddy.Log().Named("geoip2").Error("scheduled database reload failed", 
+		caddy.Log().Named("geoip2").Error("scheduled database reload failed",
 			zap.Error(err),
 			zap.Duration("duration", time.Since(startTime)))
 	} else {
@@ -388,12 +517,12 @@ func (g *GeoIP2State) Lookup(ip interface{}, result interface{}) error {
 	// Acquire read lock for database access
 	g.mutex.RLock()
 	defer g.mutex.RUnlock()
-	
-	// Check if database is available
-	if g.DBHandler == nil {
-		return errors.New("GeoIP2 database not loaded")
+
+	// Check if country database is available
+	if g.CountryDBHandler == nil {
+		return errors.New("country database not loaded")
 	}
-	
+
 	// Convert interface{} to net.IP if needed
 	var netIP net.IP
 	switch v := ip.(type) {
@@ -407,23 +536,83 @@ func (g *GeoIP2State) Lookup(ip interface{}, result interface{}) error {
 	default:
 		return fmt.Errorf("unsupported IP type: %T", ip)
 	}
-	
+
 	// Perform the actual lookup
-	return g.DBHandler.Lookup(netIP, result)
+	return g.CountryDBHandler.Lookup(netIP, result)
+}
+
+// LookupCity performs a thread-safe City database lookup
+// Used for city names, subdivisions, and geographic coordinates
+func (g *GeoIP2State) LookupCity(ip interface{}, result interface{}) error {
+	// Acquire read lock for database access
+	g.mutex.RLock()
+	defer g.mutex.RUnlock()
+
+	// Check if city database is available
+	if g.CityDBHandler == nil {
+		return errors.New("city database not loaded")
+	}
+
+	// Convert interface{} to net.IP if needed
+	var netIP net.IP
+	switch v := ip.(type) {
+	case net.IP:
+		netIP = v
+	case string:
+		netIP = net.ParseIP(v)
+		if netIP == nil {
+			return fmt.Errorf("invalid IP address: %s", v)
+		}
+	default:
+		return fmt.Errorf("unsupported IP type: %T", ip)
+	}
+
+	// Perform the actual city lookup
+	return g.CityDBHandler.Lookup(netIP, result)
+}
+
+// LookupGlobalCity performs a thread-safe global City database lookup
+// Used for city data for non-European IPs as fallback
+func (g *GeoIP2State) LookupGlobalCity(ip interface{}, result interface{}) error {
+	// Acquire read lock for database access
+	g.mutex.RLock()
+	defer g.mutex.RUnlock()
+
+	// Check if global city database is available
+	if g.GlobalCityDBHandler == nil {
+		return errors.New("global city database not loaded")
+	}
+
+	// Convert interface{} to net.IP if needed
+	var netIP net.IP
+	switch v := ip.(type) {
+	case net.IP:
+		netIP = v
+	case string:
+		netIP = net.ParseIP(v)
+		if netIP == nil {
+			return fmt.Errorf("invalid IP address: %s", v)
+		}
+	default:
+		return fmt.Errorf("unsupported IP type: %T", ip)
+	}
+
+	// Perform the actual global city lookup
+	return g.GlobalCityDBHandler.Lookup(netIP, result)
 }
 
 // LookupASN performs a thread-safe ASN database lookup
-// Used to supplement main database with ASN data when needed
+// Used for ASN number and organization lookups
 func (g *GeoIP2State) LookupASN(ip interface{}, result interface{}) error {
 	// Acquire read lock for database access
 	g.mutex.RLock()
 	defer g.mutex.RUnlock()
-	
+
 	// Check if ASN database is available
 	if g.ASNDBHandler == nil {
 		return errors.New("ASN database not loaded")
 	}
-	
+
 	// Convert interface{} to net.IP if needed
 	var netIP net.IP
 	switch v := ip.(type) {
@@ -437,7 +626,7 @@ func (g *GeoIP2State) LookupASN(ip interface{}, result interface{}) error {
 	default:
 		return fmt.Errorf("unsupported IP type: %T", ip)
 	}
-	
+
 	// Perform the actual ASN lookup
 	return g.ASNDBHandler.Lookup(netIP, result)
 }
@@ -447,22 +636,46 @@ func (g *GeoIP2State) LookupASN(ip interface{}, result interface{}) error {
 func (g *GeoIP2State) GetDatabaseInfo() map[string]interface{} {
 	g.mutex.RLock()
 	defer g.mutex.RUnlock()
-	
+
 	info := map[string]interface{}{
-		"database_path":    g.DatabasePath,
-		"reload_interval":  g.ReloadInterval,
-		"database_loaded":  g.DBHandler != nil,
+		"country_database_path":     g.CountryDatabasePath,
+		"city_database_path":        g.CityDatabasePath,
+		"global_city_database_path": g.GlobalCityDatabasePath,
+		"asn_database_path":         g.ASNDatabasePath,
+		"reload_interval":           g.ReloadInterval,
+		"country_loaded":            g.CountryDBHandler != nil,
+		"city_loaded":               g.CityDBHandler != nil,
+		"global_city_loaded":        g.GlobalCityDBHandler != nil,
+		"asn_loaded":                g.ASNDBHandler != nil,
 	}
-	
-	if g.DBHandler != nil {
-		metadata := g.DBHandler.Metadata
-		info["build_epoch"] = metadata.BuildEpoch
-		info["database_type"] = metadata.DatabaseType
-		info["ip_version"] = metadata.IPVersion
-		info["record_size"] = metadata.RecordSize
-		info["node_count"] = metadata.NodeCount
+
+	if g.CountryDBHandler != nil {
+		metadata := g.CountryDBHandler.Metadata
+		info["country_build_epoch"] = metadata.BuildEpoch
+		info["country_database_type"] = metadata.DatabaseType
+		info["country_ip_version"] = metadata.IPVersion
+		info["country_record_size"] = metadata.RecordSize
+		info["country_node_count"] = metadata.NodeCount
 	}
-	
+
+	if g.CityDBHandler != nil {
+		metadata := g.CityDBHandler.Metadata
+		info["city_build_epoch"] = metadata.BuildEpoch
+		info["city_database_type"] = metadata.DatabaseType
+		info["city_ip_version"] = metadata.IPVersion
+		info["city_record_size"] = metadata.RecordSize
+		info["city_node_count"] = metadata.NodeCount
+	}
+
+	if g.GlobalCityDBHandler != nil {
+		metadata := g.GlobalCityDBHandler.Metadata
+		info["global_city_build_epoch"] = metadata.BuildEpoch
+		info["global_city_database_type"] = metadata.DatabaseType
+		info["global_city_ip_version"] = metadata.IPVersion
+		info["global_city_record_size"] = metadata.RecordSize
+		info["global_city_node_count"] = metadata.NodeCount
+	}
+
 	return info
 }
 
@@ -476,41 +689,82 @@ func (g *GeoIP2State) Provision(ctx caddy.Context) error {
 // This is called before Start() to catch configuration errors early
 func (g GeoIP2State) Validate() error {
 	// Validate required configuration
-	if g.DatabasePath == "" {
-		return fmt.Errorf("database_path is required")
+	if g.CountryDatabasePath == "" {
+		return fmt.Errorf("country_database_path is required")
 	}
-	
+	if g.CityDatabasePath == "" {
+		return fmt.Errorf("city_database_path is required")
+	}
+	if g.GlobalCityDatabasePath == "" {
+		return fmt.Errorf("global_city_database_path is required")
+	}
+
 	// Validate reload interval
 	if g.ReloadInterval < 0 {
 		return fmt.Errorf("reload_interval cannot be negative")
 	}
-	
-	// Validate database file
-	if err := g.validateDatabaseFile(g.DatabasePath); err != nil {
-		return fmt.Errorf("database validation failed: %v", err)
+
+	// Validate database files
+	if err := g.validateDatabaseFile(g.CountryDatabasePath); err != nil {
+		return fmt.Errorf("country database validation failed: %v", err)
 	}
-	
-	// Test database can be opened
-	db, err := maxminddb.Open(g.DatabasePath)
+	if err := g.validateDatabaseFile(g.CityDatabasePath); err != nil {
+		return fmt.Errorf("city database validation failed: %v", err)
+	}
+	if err := g.validateDatabaseFile(g.GlobalCityDatabasePath); err != nil {
+		return fmt.Errorf("global city database validation failed: %v", err)
+	}
+
+	// Test databases can be opened
+	countryDB, err := maxminddb.Open(g.CountryDatabasePath)
 	if err != nil {
-		return fmt.Errorf("cannot open database %s: %v", g.DatabasePath, err)
+		return fmt.Errorf("cannot open country database %s: %v", g.CountryDatabasePath, err)
 	}
-	defer db.Close()
-	
-	// Validate database type (should be City or Country database)
-	metadata := db.Metadata
-	if metadata.DatabaseType != "GeoLite2-City" && 
-	   metadata.DatabaseType != "GeoIP2-City" && 
-	   metadata.DatabaseType != "GeoLite2-Country" && 
-	   metadata.DatabaseType != "GeoIP2-Country" {
-		caddy.Log().Named("geoip2").Warn("unknown database type", 
-			zap.String("type", metadata.DatabaseType))
+	defer countryDB.Close()
+
+	cityDB, err := maxminddb.Open(g.CityDatabasePath)
+	if err != nil {
+		return fmt.Errorf("cannot open city database %s: %v", g.CityDatabasePath, err)
 	}
-	
+	defer cityDB.Close()
+
+	globalCityDB, err := maxminddb.Open(g.GlobalCityDatabasePath)
+	if err != nil {
+		return fmt.Errorf("cannot open global city database %s: %v", g.GlobalCityDatabasePath, err)
+	}
+	defer globalCityDB.Close()
+
+	// Validate country database type (should be Country database)
+	countryMetadata := countryDB.Metadata
+	if countryMetadata.DatabaseType != "GeoLite2-Country" &&
+		countryMetadata.DatabaseType != "GeoIP2-Country" {
+		caddy.Log().Named("geoip2").Warn("unknown country database type",
+			zap.String("type", countryMetadata.DatabaseType))
+	}
+
+	// Validate city database type (should be City database)
+	cityMetadata := cityDB.Metadata
+	if cityMetadata.DatabaseType != "GeoLite2-City" &&
+		cityMetadata.DatabaseType != "GeoIP2-City" {
+		caddy.Log().Named("geoip2").Warn("unknown city database type",
+			zap.String("type", cityMetadata.DatabaseType))
+	}
+
+	globalCityMetadata := globalCityDB.Metadata
+	if globalCityMetadata.DatabaseType != "GeoLite2-City" &&
+		globalCityMetadata.DatabaseType != "GeoIP2-City" {
+		caddy.Log().Named("geoip2").Warn("unknown global city database type",
+			zap.String("type", globalCityMetadata.DatabaseType))
+	}
+
 	caddy.Log().Named("geoip2").Info("validation successful",
-		zap.String("database_type", metadata.DatabaseType),
-		zap.Uint64("build_epoch", uint64(metadata.BuildEpoch)))
-	
+		zap.String("country_database_type", countryMetadata.DatabaseType),
+		zap.Uint64("country_build_epoch", uint64(countryMetadata.BuildEpoch)),
+		zap.String("city_database_type", cityMetadata.DatabaseType),
+		zap.Uint64("city_build_epoch", uint64(cityMetadata.BuildEpoch)),
+		zap.String("global_city_database_type", globalCityMetadata.DatabaseType),
+		zap.Uint64("global_city_build_epoch", uint64(globalCityMetadata.BuildEpoch)))
+
 	return nil
 }
 

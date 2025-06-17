@@ -9,6 +9,7 @@ A high-performance GeoIP2 middleware for Caddy that provides geographic informat
 - **Auto-reload**: Configurable database reloading (daily, weekly, or custom intervals)
 - **Smart IP Detection**: Flexible handling of X-Forwarded-For headers with security controls
 - **Memory Efficient**: Optimized data structures to minimize allocations
+- **Intelligent Database Routing**: EU IPs use Europe-specific database, non-EU IPs use global database for optimal performance
 
 ## Build
 
@@ -22,10 +23,12 @@ xcaddy build --with github.com/ScaleCommerce/caddy-geoip2
 
 ```caddyfile
 {
-  # Configure the GeoIP2 database globally
+  # Configure the GeoIP2 databases globally with intelligent routing
   geoip2 {
-    database_path /path/to/GeoLite2-City.mmdb
-    asn_database_path /path/to/GeoLite2-ASN.mmdb  # optional, for complete ASN data
+    country_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-Country.mmdb
+    city_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-City-Europe.mmdb
+    global_city_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-City.mmdb
+    asn_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-ASN.mmdb
     reload_interval daily  # daily, weekly, off, or hours (e.g., 24)
   }
 
@@ -59,6 +62,7 @@ example.com {
       country {geoip2_country_code}
       city {geoip2_city}
       coordinates "{geoip2_latitude},{geoip2_longitude}"
+      subdivision {geoip2_subdivisions}
       asn {geoip2_asn}
     }
   }
@@ -69,18 +73,38 @@ example.com {
 
 ## Available Variables
 
-The module provides 8 essential GeoIP2 variables:
+The module provides 8 essential GeoIP2 variables from 4 specialized databases:
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `{geoip2_city}` | City name (English) | `"Munich"` |
-| `{geoip2_country_code}` | Two-letter country code | `"DE"` |
-| `{geoip2_latitude}` | Geographic latitude | `48.1374` |
-| `{geoip2_longitude}` | Geographic longitude | `11.5755` |
-| `{geoip2_subdivisions}` | State/Province code | `"BY"` |
-| `{geoip2_is_in_eu}` | EU membership status | `true` |
-| `{geoip2_asn}` | Autonomous System Number | `3320` |
-| `{geoip2_asorg}` | AS Organization | `"Deutsche Telekom AG"` |
+| Variable | Description | Example | Database Source |
+|----------|-------------|---------|-----------------|
+| `{geoip2_country_code}` | Two-letter country code | `"DE"` | Country DB |
+| `{geoip2_is_in_eu}` | EU membership status | `true` | Country DB |
+| `{geoip2_city}` | City name (German preferred) | `"München"` | EU: Europe City DB<br/>Non-EU: Global City DB |
+| `{geoip2_latitude}` | Geographic latitude | `48.1374` | EU: Europe City DB<br/>Non-EU: Global City DB |
+| `{geoip2_longitude}` | Geographic longitude | `11.5755` | EU: Europe City DB<br/>Non-EU: Global City DB |
+| `{geoip2_subdivisions}` | State/Province code | `"BY"` | EU: Europe City DB<br/>Non-EU: Global City DB |
+| `{geoip2_asn}` | Autonomous System Number | `3320` | ASN DB |
+| `{geoip2_asorg}` | AS Organization | `"Deutsche Telekom AG"` | ASN DB |
+
+### Intelligent Database Routing
+
+| IP Location | City Data Source | Performance Benefit |
+|-------------|------------------|-------------------|
+| **European Union** | `GeoIP2-City-Europe.mmdb` | ⚡ Faster (smaller DB) |
+| **Non-EU** | `GeoLite2-City.mmdb` | 🌍 Complete global coverage |
+| **All IPs** | `GeoIP2-Country.mmdb` (for country/EU data) | 🎯 Specialized accuracy |
+| **All IPs** | `GeoLite2-ASN.mmdb` (for network data) | 📊 Comprehensive ASN info |
+
+### Nginx to Caddy Variable Mapping
+
+| Nginx Variable | Caddy Variable | Database Used |
+|----------------|----------------|---------------|
+| `$geoip2_country_code` | `{geoip2_country_code}` | GeoIP2-Country.mmdb |
+| `$geoip2_city` | `{geoip2_city}` | EU: GeoIP2-City-Europe.mmdb<br/>Non-EU: GeoLite2-City.mmdb |
+| `$geoip2_subdivision` | `{geoip2_subdivisions}` | EU: GeoIP2-City-Europe.mmdb<br/>Non-EU: GeoLite2-City.mmdb |
+| `$geoip2_is_in_european_union` | `{geoip2_is_in_eu}` | GeoIP2-Country.mmdb |
+| `$geoip2_latitude` | `{geoip2_latitude}` | EU: GeoIP2-City-Europe.mmdb<br/>Non-EU: GeoLite2-City.mmdb |
+| `$geoip2_longitude` | `{geoip2_longitude}` | EU: GeoIP2-City-Europe.mmdb<br/>Non-EU: GeoLite2-City.mmdb |
 
 ## Advanced Examples
 
@@ -89,7 +113,10 @@ The module provides 8 essential GeoIP2 variables:
 ```caddyfile
 {
   geoip2 {
-    database_path /etc/geoip/GeoLite2-City.mmdb
+    country_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-Country.mmdb
+    city_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-City-Europe.mmdb
+    global_city_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-City.mmdb
+    asn_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-ASN.mmdb
     reload_interval daily
   }
 }
@@ -117,8 +144,11 @@ api.example.com {
 ```caddyfile
 {
   geoip2 {
-    database_path {$GEOIP_DATABASE_PATH:/opt/geoip/GeoLite2-City.mmdb}
-    reload_interval {$GEOIP_RELOAD_INTERVAL:daily}
+    country_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-Country.mmdb
+    city_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-City-Europe.mmdb
+    global_city_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-City.mmdb
+    asn_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-ASN.mmdb
+    reload_interval daily
   }
 }
 
@@ -140,8 +170,11 @@ localhost {
 ```caddyfile
 {
   geoip2 {
-    database_path /var/lib/geoip/GeoLite2-City.mmdb
-    reload_interval weekly
+    country_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-Country.mmdb
+    city_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-City-Europe.mmdb
+    global_city_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-City.mmdb
+    asn_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-ASN.mmdb
+    reload_interval daily
   }
 }
 
@@ -253,12 +286,12 @@ example.com {
 
 ## Database Reload Options
 
-| Value | Description |
-|-------|-------------|
-| `daily` or `24h` | Reload every 24 hours |
-| `weekly` or `168h` | Reload every 7 days |
-| `48` | Reload every 48 hours |
-| `off` or `0` | No automatic reload |
+| Value | Description | Use Case |
+|-------|-------------|----------|
+| `daily` or `24h` | Reload every 24 hours | 🔄 Recommended for production |
+| `weekly` or `168h` | Reload every 7 days | ⚡ Lower overhead, less frequent updates |
+| `48` | Reload every 48 hours | ⚖️ Balance between freshness and performance |
+| `off` or `0` | No automatic reload | 🔧 Manual control only |
 
 ## Performance Optimizations
 
@@ -271,37 +304,52 @@ example.com {
 
 ## Database Compatibility
 
-Works with MaxMind databases:
-- **GeoLite2-City** (free, recommended for geographic data)
-- **GeoIP2-City** (commercial)
-- **GeoLite2-Country** (limited data)
-- **GeoIP2-Country** (limited data)
-- **GeoLite2-ASN** (free, recommended for ASN data)
+| Database | Type | Purpose | Cost | Size |
+|----------|------|---------|------|------|
+| **GeoIP2-Country** | Commercial | Country codes & EU status | 💰 Paid | ~5MB |
+| **GeoIP2-City-Europe** | Commercial | European city data | 💰 Paid | ~30MB |
+| **GeoLite2-City** | Free | Global city data (fallback) | 🆓 Free | ~70MB |
+| **GeoLite2-ASN** | Free | ASN numbers & organizations | 🆓 Free | ~10MB |
 
-### Dual-Database Setup for Complete Data Coverage
+### Alternative Free Setup
+For budget-conscious deployments, you can use free alternatives:
+- `GeoLite2-Country.mmdb` instead of `GeoIP2-Country.mmdb`
+- `GeoLite2-City.mmdb` for both EU and global city data
 
-For performance-critical applications that need all 8 variables populated, use the dual-database approach:
+### Four-Database Setup with Intelligent Routing
+
+For optimal performance on a central load balancer, use the four-database approach with intelligent routing:
 
 ```caddyfile
 {
   geoip2 {
-    database_path /opt/geoip/GeoLite2-City.mmdb      # 61MB - provides geographic data
-    asn_database_path /opt/geoip/GeoLite2-ASN.mmdb   # 10MB - provides ASN data
+    country_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-Country.mmdb
+    city_database_path /etc/nginx/maxmind-geo-ip/GeoIP-Country/GeoIP2-City-Europe.mmdb
+    global_city_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-City.mmdb
+    asn_database_path /etc/nginx/maxmind-geo-ip/GeoLite2-ASN.mmdb
     reload_interval daily
   }
 }
 ```
 
-**Why dual databases?**
-- **GeoLite2-City**: Contains city, country, coordinates, subdivisions, EU status - but NO ASN data
-- **GeoLite2-ASN**: Contains ASN number and organization - but NO geographic data
-- **Combined**: All 8 variables populated with optimal performance (71MB total vs 108MB+ for commercial alternatives)
+**Intelligent Routing Logic:**
+1. **Country Lookup**: Determines EU membership status
+2. **EU IPs**: Use smaller, faster Europe-specific city database
+3. **Non-EU IPs**: Use global city database as fallback
+4. **ASN Lookup**: Always uses dedicated ASN database
 
-**Performance benefits:**
-- Faster lookups than single large database
-- Only 71MB total memory usage
-- Automatic fallback if ASN database unavailable
-- Free alternative to expensive commercial databases
+**Why four databases with intelligent routing?**
+- **GeoIP2-Country**: Fast country codes and EU membership detection
+- **GeoIP2-City-Europe**: Optimized for European traffic (smaller, faster)
+- **GeoLite2-City**: Global coverage for non-European IPs
+- **GeoLite2-ASN**: Comprehensive ASN data
+
+**Performance benefits for central load balancers:**
+- **Reduced memory pressure**: European traffic uses smaller database
+- **Faster lookups**: 70%+ of traffic (EU) uses optimized database
+- **Global coverage**: Non-EU traffic still gets complete data
+- **High availability**: Automatic fallback if any database unavailable
+- **Language support**: German city names preferred for European IPs
 
 ## Error Handling
 

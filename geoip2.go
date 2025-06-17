@@ -14,14 +14,22 @@ import (
 	"go.uber.org/zap"
 )
 
-// GeoIP2Record defines the minimal structure needed from MaxMind database
-// Only includes the fields we actually use to minimize memory allocation
-type GeoIP2Record struct {
+// CountryRecord defines the structure for Country database lookups
+// Contains country-specific information including EU membership status
+type CountryRecord struct {
 	Country struct {
 		ISOCode           string `maxminddb:"iso_code"`             // Two-letter country code (e.g., "DE", "US")
 		IsInEuropeanUnion bool   `maxminddb:"is_in_european_union"` // Whether country is in EU
 	} `maxminddb:"country"`
 
+	RegisteredCountry struct {
+		IsInEuropeanUnion bool `maxminddb:"is_in_european_union"` // Whether registered country is in EU
+	} `maxminddb:"registered_country"`
+}
+
+// CityRecord defines the structure for City database lookups
+// Contains city, subdivision, and location information
+type CityRecord struct {
 	City struct {
 		Names map[string]string `maxminddb:"names"` // City names in different languages
 	} `maxminddb:"city"`
@@ -34,15 +42,10 @@ type GeoIP2Record struct {
 	Subdivisions []struct {
 		IsoCode string `maxminddb:"iso_code"` // State/Province code (e.g., "CA", "BY")
 	} `maxminddb:"subdivisions"`
-
-	Traits struct {
-		AutonomousSystemNumber       uint64 `maxminddb:"autonomous_system_number"`       // ASN number
-		AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"` // ASN organization name
-	} `maxminddb:"traits"`
 }
 
 // ASNRecord defines the structure for ASN database lookups
-// Used when main database doesn't contain ASN data
+// Used for autonomous system information
 type ASNRecord struct {
 	AutonomousSystemNumber       uint64 `maxminddb:"autonomous_system_number"`       // ASN number
 	AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"` // ASN organization name
@@ -57,10 +60,10 @@ type GeoIP2 struct {
 	// - "trusted_proxies": trust X-Forwarded-For only from trusted proxies (default)
 	// - "off"/"false"/"0": disable GeoIP2 lookups
 	Enable string `json:"enable,omitempty"`
-	
+
 	// state holds reference to the shared GeoIP2 database state
 	state *GeoIP2State `json:"-"`
-	
+
 	// ctx is the Caddy context for this module instance
 	ctx caddy.Context `json:"-"`
 }
@@ -106,7 +109,7 @@ func (GeoIP2) CaddyModule() caddy.ModuleInfo {
 func (m GeoIP2) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// Get Caddy's replacer to set variables that can be used in config
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	
+
 	// Initialize all GeoIP2 variables with empty defaults
 	// This ensures they're always available even if lookup fails
 	m.initializeVariables(repl)
@@ -139,92 +142,133 @@ func (m *GeoIP2) isEnabled() bool {
 	return m.Enable != "off" && m.Enable != "false" && m.Enable != "0"
 }
 
-// performLookup does the actual GeoIP2 database lookup and sets variables
+// performLookup does the actual GeoIP2 database lookups and sets variables
+// Implements intelligent routing: EU IPs use Europe-specific city database,
+// non-EU IPs use global city database for optimal performance
 func (m *GeoIP2) performLookup(r *http.Request, repl *caddy.Replacer) {
-	// Check if database is available
-	if m.state == nil || m.state.DBHandler == nil {
-		caddy.Log().Named("http.handlers.geoip2").Warn("GeoIP2 database not available")
+	// Check if databases are available
+	if m.state == nil {
+		caddy.Log().Named("http.handlers.geoip2").Warn("GeoIP2 state not available")
 		return
 	}
 
 	// Get client IP address based on configured safety level
 	clientIP, err := m.getClientIP(r)
 	if err != nil {
-		caddy.Log().Named("http.handlers.geoip2").Debug("failed to get client IP", 
+		caddy.Log().Named("http.handlers.geoip2").Debug("failed to get client IP",
 			zap.Error(err))
 		return
 	}
 
-	// Perform main database lookup
-	var record GeoIP2Record
-	if err := m.state.Lookup(clientIP, &record); err != nil {
-		caddy.Log().Named("http.handlers.geoip2").Debug("GeoIP2 lookup failed",
-			zap.String("ip", clientIP.String()),
-			zap.Error(err))
-		return
-	}
-
-	// If ASN data is missing from main database and ASN database is available, lookup ASN data
-	if (record.Traits.AutonomousSystemNumber == 0 || record.Traits.AutonomousSystemOrganization == "") && 
-	   m.state.ASNDBHandler != nil {
-		var asnRecord ASNRecord
-		if err := m.state.LookupASN(clientIP, &asnRecord); err == nil {
-			// Supplement main record with ASN data
-			if record.Traits.AutonomousSystemNumber == 0 {
-				record.Traits.AutonomousSystemNumber = asnRecord.AutonomousSystemNumber
-			}
-			if record.Traits.AutonomousSystemOrganization == "" {
-				record.Traits.AutonomousSystemOrganization = asnRecord.AutonomousSystemOrganization
-			}
+	// Perform Country database lookup first (needed for EU routing decision)
+	var countryRecord CountryRecord
+	var countryCode string
+	var isInEU bool
+	if m.state.CountryDBHandler != nil {
+		if err := m.state.Lookup(clientIP, &countryRecord); err != nil {
+			caddy.Log().Named("http.handlers.geoip2").Debug("Country lookup failed",
+				zap.String("ip", clientIP.String()),
+				zap.Error(err))
 		} else {
+			countryCode = countryRecord.Country.ISOCode
+			// Check both country and registered_country for EU status
+			isInEU = countryRecord.Country.IsInEuropeanUnion || countryRecord.RegisteredCountry.IsInEuropeanUnion
+		}
+	}
+
+	// Perform intelligent City database lookup based on EU status
+	var cityRecord CityRecord
+	var cityName string
+	var latitude, longitude float64
+	var subdivision string
+
+	// Decide which city database to use based on EU status
+	var cityLookupFunc func(interface{}, interface{}) error
+	var dbName string
+
+	if isInEU && m.state.CityDBHandler != nil {
+		// EU IP: Use Europe-specific database
+		cityLookupFunc = m.state.LookupCity
+		dbName = "Europe city database"
+	} else if m.state.GlobalCityDBHandler != nil {
+		// Non-EU IP: Use global database as fallback
+		cityLookupFunc = m.state.LookupGlobalCity
+		dbName = "Global city database"
+	}
+
+	if cityLookupFunc != nil {
+		if err := cityLookupFunc(clientIP, &cityRecord); err != nil {
+			caddy.Log().Named("http.handlers.geoip2").Debug("City lookup failed",
+				zap.String("ip", clientIP.String()),
+				zap.String("database", dbName),
+				zap.Bool("is_eu", isInEU),
+				zap.Error(err))
+		} else {
+			// Extract city name (prefer German as specified in nginx config, fallback to English, then any)
+			if name, exists := cityRecord.City.Names["de"]; exists && name != "" {
+				cityName = name
+			} else if name, exists := cityRecord.City.Names["en"]; exists && name != "" {
+				cityName = name
+			} else {
+				// If no German or English name, try to get any available city name
+				for _, name := range cityRecord.City.Names {
+					if name != "" {
+						cityName = name
+						break
+					}
+				}
+			}
+
+			// Extract location data
+			latitude = cityRecord.Location.Latitude
+			longitude = cityRecord.Location.Longitude
+
+			// Extract subdivision (state/province) - use first available
+			if len(cityRecord.Subdivisions) > 0 && cityRecord.Subdivisions[0].IsoCode != "" {
+				subdivision = cityRecord.Subdivisions[0].IsoCode
+			}
+
+			caddy.Log().Named("http.handlers.geoip2").Debug("City lookup successful",
+				zap.String("ip", clientIP.String()),
+				zap.String("database", dbName),
+				zap.Bool("is_eu", isInEU),
+				zap.String("city", cityName))
+		}
+	}
+
+	// Perform ASN database lookup
+	var asnRecord ASNRecord
+	var asnNumber uint64
+	var asnOrg string
+	if m.state.ASNDBHandler != nil {
+		if err := m.state.LookupASN(clientIP, &asnRecord); err != nil {
 			caddy.Log().Named("http.handlers.geoip2").Debug("ASN lookup failed",
 				zap.String("ip", clientIP.String()),
 				zap.Error(err))
+		} else {
+			asnNumber = asnRecord.AutonomousSystemNumber
+			asnOrg = asnRecord.AutonomousSystemOrganization
 		}
 	}
 
-	// Populate replacer variables with lookup results
-	m.setGeoIPVariables(repl, &record)
+	// Set all GeoIP2 variables with the combined results
+	repl.Set(VarCountryCode, countryCode)
+	repl.Set(VarIsInEU, isInEU)
+	repl.Set(VarCity, cityName)
+	repl.Set(VarLatitude, latitude)
+	repl.Set(VarLongitude, longitude)
+	repl.Set(VarSubdivisions, subdivision)
+	repl.Set(VarASN, asnNumber)
+	repl.Set(VarASOrg, asnOrg)
 
-	// Debug logging
-	caddy.Log().Named("http.handlers.geoip2").Debug("GeoIP2 lookup successful",
+	// Debug logging with performance information
+	caddy.Log().Named("http.handlers.geoip2").Debug("GeoIP2 lookups completed",
 		zap.String("ip", clientIP.String()),
-		zap.String("country", record.Country.ISOCode),
-		zap.String("city", record.City.Names["en"]),
-		zap.Uint64("asn", record.Traits.AutonomousSystemNumber))
-}
-
-// setGeoIPVariables populates all GeoIP2 variables from the lookup result
-func (m *GeoIP2) setGeoIPVariables(repl *caddy.Replacer, record *GeoIP2Record) {
-	// Basic country information
-	repl.Set(VarCountryCode, record.Country.ISOCode)
-	repl.Set(VarIsInEU, record.Country.IsInEuropeanUnion)
-	
-	// Geographic coordinates
-	repl.Set(VarLatitude, record.Location.Latitude)
-	repl.Set(VarLongitude, record.Location.Longitude)
-	
-	// Network information (ASN)
-	repl.Set(VarASN, record.Traits.AutonomousSystemNumber)
-	repl.Set(VarASOrg, record.Traits.AutonomousSystemOrganization)
-
-	// City name (prefer English, fallback to any available)
-	if cityName, exists := record.City.Names["en"]; exists && cityName != "" {
-		repl.Set(VarCity, cityName)
-	} else {
-		// If no English name, try to get any available city name
-		for _, name := range record.City.Names {
-			if name != "" {
-				repl.Set(VarCity, name)
-				break
-			}
-		}
-	}
-
-	// Subdivisions (state/province) - use first available
-	if len(record.Subdivisions) > 0 && record.Subdivisions[0].IsoCode != "" {
-		repl.Set(VarSubdivisions, record.Subdivisions[0].IsoCode)
-	}
+		zap.String("country", countryCode),
+		zap.String("city", cityName),
+		zap.Bool("is_in_eu", isInEU),
+		zap.String("city_database_used", dbName),
+		zap.Uint64("asn", asnNumber))
 }
 
 // getClientIP determines the real client IP address based on configuration
@@ -305,24 +349,24 @@ func (m *GeoIP2) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // Links this handler to the shared GeoIP2 database state
 func (g *GeoIP2) Provision(ctx caddy.Context) error {
 	caddy.Log().Named("http.handlers.geoip2").Debug("provisioning GeoIP2 handler")
-	
+
 	// Get reference to the shared GeoIP2 app/state
 	app, err := ctx.App(moduleName)
 	if err != nil {
 		return fmt.Errorf("getting geoip2 app: %v", err)
 	}
-	
+
 	// Store reference to shared state
 	g.state = app.(*GeoIP2State)
 	g.ctx = ctx
-	
+
 	return nil
 }
 
 // Validate checks if the configuration is valid
 func (g GeoIP2) Validate() error {
 	caddy.Log().Named("http.handlers.geoip2").Debug("validating GeoIP2 handler")
-	
+
 	// Validate Enable setting
 	validModes := []string{"strict", "wild", "trusted_proxies", "off", "false", "0", ""}
 	mode := strings.ToLower(g.Enable)
@@ -331,7 +375,7 @@ func (g GeoIP2) Validate() error {
 			return nil
 		}
 	}
-	
+
 	return fmt.Errorf("invalid enable mode '%s', must be one of: %v", g.Enable, validModes)
 }
 
