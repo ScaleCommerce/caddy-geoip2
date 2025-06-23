@@ -745,14 +745,16 @@ func (g GeoIP2State) Validate() error {
 	// Validate city database type (should be City database)
 	cityMetadata := cityDB.Metadata
 	if cityMetadata.DatabaseType != "GeoLite2-City" &&
-		cityMetadata.DatabaseType != "GeoIP2-City" {
+		cityMetadata.DatabaseType != "GeoIP2-City" &&
+		cityMetadata.DatabaseType != "GeoIP2-City-Europe" {
 		caddy.Log().Named("geoip2").Warn("unknown city database type",
 			zap.String("type", cityMetadata.DatabaseType))
 	}
 
 	globalCityMetadata := globalCityDB.Metadata
 	if globalCityMetadata.DatabaseType != "GeoLite2-City" &&
-		globalCityMetadata.DatabaseType != "GeoIP2-City" {
+		globalCityMetadata.DatabaseType != "GeoIP2-City" &&
+		globalCityMetadata.DatabaseType != "GeoIP2-City-Europe" {
 		caddy.Log().Named("geoip2").Warn("unknown global city database type",
 			zap.String("type", globalCityMetadata.DatabaseType))
 	}
